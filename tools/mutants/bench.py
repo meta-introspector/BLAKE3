@@ -112,6 +112,7 @@ def main():
     mutants = json.loads(subprocess.run(listing, cwd=check.ROOT, capture_output=True, text=True, check=True).stdout)
     head = git("rev-parse", "HEAD").strip()
     tree = os.path.join(check.scratch_dir(), "mutants-bench")
+    git("worktree", "prune")  # a worktree deleted with tmp/ stays registered until pruned
     if not os.path.exists(tree):
         git("worktree", "add", "-q", "--detach", tree, head)
         subprocess.run(["git", "clone", "-q", "--shared", os.path.join(check.ROOT, "bench-hashes"), os.path.join(tree, "bench-hashes")], check=True)
