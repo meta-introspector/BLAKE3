@@ -75,12 +75,16 @@ pub enum Verdict {
     Level,
 }
 
-/// A cell's judgment: its verdict and the ratio judged, the geometric mean
-/// of its pairs' ratios (new over old, permille).
+/// A cell's judgment: its verdict; the ratio judged, the geometric mean
+/// of its pairs' ratios (new over old, permille); and its rank, its place
+/// among the cells judged together by the strength of the evidence that it
+/// changed (its p-value), 0 for the strongest. A level cell's rank says
+/// which to measure again: its ratio alone favors the noisiest cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Judgment {
     pub verdict: Verdict,
     pub ratio_permille: u64,
+    pub rank: usize,
 }
 
 /// The mean of the pairs' log ratios, ln(new / old). Requires some pairs,
@@ -160,7 +164,11 @@ pub fn discoveries(cells: &[Vec<(u128, u128)>], q_permille: u64, margin_permille
             verdicts[i] = Verdict::Faster;
         }
     }
-    verdicts.into_iter().zip(cells).map(|(verdict, c)| Judgment { verdict, ratio_permille: geometric_mean_permille(c) }).collect()
+    let mut rank = vec![0; m];
+    for (r, &i) in order.iter().enumerate() {
+        rank[i] = r;
+    }
+    verdicts.into_iter().zip(cells).zip(rank).map(|((verdict, c), rank)| Judgment { verdict, ratio_permille: geometric_mean_permille(c), rank }).collect()
 }
 
 /// Student's t two-sided p-value: P(|T| >= |t|) with `df` degrees of
@@ -316,5 +324,16 @@ mod tests {
         many.push(pairs(&[1100, 1102, 1098, 1101, 1099]));
         assert_eq!(discoveries(&many, 50, 30).iter().filter(|j| j.verdict != Verdict::Level).count(), 1);
         assert!(discoveries(&many, 0, 30).iter().all(|j| j.verdict == Verdict::Level));
+    }
+
+    /// Ranks follow the evidence, not the ratio: a cell 4% slower in every
+    /// pair outranks one whose pairs scatter to a 10% mean.
+    #[test]
+    fn discoveries_rank_by_evidence() {
+        let pairs = |ratios: &[u128]| ratios.iter().map(|&r| (1000u128 << 63, r << 63)).collect::<Vec<_>>();
+        let cells = vec![pairs(&[1300, 900, 1250, 950, 1100]), pairs(&[1040, 1041, 1039, 1040, 1040]), pairs(&[1030, 970, 1025, 975, 1000])];
+        let judged = discoveries(&cells, 50, 30);
+        assert!(judged[0].ratio_permille > judged[1].ratio_permille);
+        assert_eq!(judged.iter().map(|j| j.rank).collect::<Vec<_>>(), [1, 0, 2]);
     }
 }
