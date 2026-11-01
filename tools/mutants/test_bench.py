@@ -17,6 +17,14 @@ class Rows(unittest.TestCase):
                          [("src/a.rs", "replace f with ()"), ("src/a.rs", "delete ! in g"), ("src/a.rs", "replace h -> bool with true")])
 
 
+class Bench(unittest.TestCase):
+    def test_the_bench_is_the_hooks(self):
+        # Beside the checkout, as the pre-commit hook takes it ...
+        self.assertEqual(bench.bench_dir({}, "/w/BLAKE3"), "/w/bench-hashes")
+        # ... or where BENCH_HASHES_DIR names.
+        self.assertEqual(bench.bench_dir({"BENCH_HASHES_DIR": "/b"}, "/w/BLAKE3"), "/b")
+
+
 class Places(unittest.TestCase):
     def test_a_place_any_test_did_not_pass_is_caught(self):
         tsv = ["# header\n",

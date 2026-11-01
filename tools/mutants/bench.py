@@ -6,8 +6,8 @@
 A row whose reason starts "speed" or "equally correct" says its mutant is
 correct either way and faster one way: a claim a benchmark can test. Each
 surviving place of such a mutant is applied alone to a clean worktree of
-HEAD, and `bench-hashes check --against HEAD` measures the cells that run
-its changed lines. Its verdict, one line a place:
+HEAD, and `bench-hashes check --fork WORKTREE --against HEAD` measures
+the cells that run its changed lines. Its verdict, one line a place:
 
     slower           the path earns its place (now with a figure)
     no cell slower   a candidate to delete: correct, and as fast either way
@@ -25,7 +25,8 @@ gained or changed since REV, as check.py --since does for survivors.
 
 One mutant at a time, about 10 minutes each on an i7-12700K: one heavy
 job (run it under a bounded supervisor, nothing else measuring). The
-bench is the checkout's bench-hashes/, as for check.
+bench is the pre-commit hook's: the checkout BENCH_HASHES_DIR names, or
+bench-hashes/ beside this one.
 """
 import json
 import os
@@ -88,6 +89,11 @@ def largest(stdout, shown=3):
     return out
 
 
+def bench_dir(environ, root):
+    """The bench's checkout, as the pre-commit hook finds it."""
+    return environ.get("BENCH_HASHES_DIR") or os.path.join(os.path.dirname(root), "bench-hashes")
+
+
 def git(*args, **kw):
     return subprocess.run(["git", "-C", check.ROOT, *args], capture_output=True, text=True, check=True, **kw).stdout
 
@@ -115,18 +121,17 @@ def main():
     git("worktree", "prune")  # a worktree deleted with tmp/ stays registered until pruned
     if not os.path.exists(tree):
         git("worktree", "add", "-q", "--detach", tree, head)
-        subprocess.run(["git", "clone", "-q", "--shared", os.path.join(check.ROOT, "bench-hashes"), os.path.join(tree, "bench-hashes")], check=True)
-        bench_head = subprocess.run(["git", "-C", os.path.join(check.ROOT, "bench-hashes"), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
-        subprocess.run(["git", "-C", os.path.join(tree, "bench-hashes"), "checkout", "-q", "--detach", bench_head], check=True)
     git("-C", tree, "checkout", "-q", "--detach", head)
+    bench = bench_dir(os.environ, check.ROOT)
+    assert os.path.exists(os.path.join(bench, "Cargo.toml")), f"no bench-hashes checkout at {bench} (clone it beside this checkout, or set BENCH_HASHES_DIR)"
     print(f"bench: {len(rows)} rows claim speed alone, at {head[:12]}; {pairs} pairs a place", flush=True)
     for row in rows:
         for m in surviving(mutants, row, caught):
             place = m["name"].split(": ", 1)[0].split(":", 1)[1]
             subprocess.run(["patch", "-s", os.path.join(tree, row[0])], input=m["diff"], text=True, check=True)
             try:
-                run = subprocess.run(["cargo", "run", "-q", "--release", "--", "check", "--against", head, "--pairs", pairs],
-                                     cwd=os.path.join(tree, "bench-hashes"), capture_output=True, text=True)
+                run = subprocess.run(["cargo", "run", "-q", "--release", "--", "check", "--fork", tree, "--against", head, "--pairs", pairs],
+                                     cwd=bench, capture_output=True, text=True)
             finally:
                 git("-C", tree, "checkout", "-q", "--", row[0])
             v, faster = verdict(run.returncode, run.stdout)
