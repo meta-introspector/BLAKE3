@@ -192,7 +192,9 @@ fn close(state: &mut State, least_ns: u64) {
 /// Add a window, reporting it on stderr when busy.
 fn push(state: &mut State, window: Window) {
     if window.busy() {
-        eprintln!("clocks: {}; measurements in that time may read slower than this machine runs", describe_window(&window));
+        let top = imp::busiest(window.end_ns - window.start_ns);
+        let top = if top.is_empty() { String::new() } else { format!(" (the busiest: {top})") };
+        eprintln!("clocks: {}{top}; measurements in that time may read slower than this machine runs", describe_window(&window));
     }
     state.windows.push(window);
 }
@@ -360,15 +362,54 @@ mod imp {
         // user nice system idle iowait irq softirq steal (guest time is inside user).
         assert!(fields.len() >= 8, "/proc/stat's cpu line has at least eight fields");
         let procs = scan()?;
-        let others = procs.iter().filter(|&(&pid, _)| !ours(std::process::id(), pid, &procs)).map(|(_, p)| p.system).sum();
+        let me = std::process::id();
+        let others = procs.iter().filter(|&(&pid, _)| !ours(me, pid, &procs)).map(|(_, p)| p.system).sum();
+        note_busiest(&procs, me);
         Some(CpuTimes { user: fields[0] + fields[1], steal: fields[7], others })
     }
 
+    /// Each other process's CPU time at the last reading (name, ticks), and
+    /// the three that took the most since the reading before it (name,
+    /// ticks): what a busy window names (BLAKE3 #142's reviews on
+    /// bench-hashes #98: a 112-CPU machine's busy windows, unexplained).
+    static LAST: std::sync::Mutex<(Option<HashMap<u32, (String, u64)>>, Vec<(String, u64)>)> = std::sync::Mutex::new((None, Vec::new()));
+
+    fn note_busiest(procs: &HashMap<u32, Proc>, me: u32) {
+        let now: HashMap<u32, (String, u64)> =
+            procs.iter().filter(|&(&pid, _)| !ours(me, pid, procs)).map(|(&pid, p)| (pid, (p.name.clone(), p.user + p.system))).collect();
+        let mut last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(was) = &last.0 {
+            let mut took: Vec<(String, u64)> =
+                now.iter().filter_map(|(pid, (name, t))| Some((name.clone(), t.checked_sub(was.get(pid)?.1)?))).filter(|(_, d)| *d > 0).collect();
+            took.sort_by(|a, b| b.1.cmp(&a.1));
+            took.truncate(3);
+            last.1 = took;
+        }
+        last.0 = Some(now);
+    }
+
+    /// The three processes that took the most CPU time between the last two
+    /// readings, over `window_ns`: "kswapd0 1.20 CPUs, python3 0.40 CPUs".
+    pub fn busiest(window_ns: u64) -> String {
+        let last = LAST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ns = |ticks: u64| ticks * 1_000_000_000 / ticks_per_second();
+        last.1
+            .iter()
+            .map(|(name, t)| {
+                format!("{name} {} CPUs", super::cpus(u64::try_from(u128::from(ns(*t)) * 1000 / u128::from(window_ns.max(1))).unwrap_or(u64::MAX)))
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// One process, as its /proc/PID/stat gives it.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct Proc {
+        pub(super) name: String,
         pub(super) parent: u32,
         pub(super) kernel_thread: bool,
+        /// User time and its waited-for children's (utime + cutime), ticks.
+        pub(super) user: u64,
         /// System time and its waited-for children's (stime + cstime), ticks.
         pub(super) system: u64,
     }
@@ -377,12 +418,20 @@ mod imp {
     pub(super) fn parse_stat(stat: &str) -> Option<Proc> {
         // The command name, in parentheses, may hold anything: fields
         // resume after its last ')'.
-        let rest = stat.get(stat.rfind(')')? + 2..)?;
+        let close = stat.rfind(')')?;
+        let name = stat.get(stat.find('(')? + 1..close)?.to_string();
+        let rest = stat.get(close + 2..)?;
         let f: Vec<&str> = rest.split_whitespace().collect();
         // Fields 3.. of proc(5): state ppid ... flags(9) ... utime(14) stime cutime cstime.
         const PF_KTHREAD: u64 = 0x0020_0000;
         let number = |i: usize| f.get(i)?.parse::<u64>().ok();
-        Some(Proc { parent: f.get(1)?.parse().ok()?, kernel_thread: number(6)? & PF_KTHREAD != 0, system: number(12)? + number(14)? })
+        Some(Proc {
+            name,
+            parent: f.get(1)?.parse().ok()?,
+            kernel_thread: number(6)? & PF_KTHREAD != 0,
+            user: number(11)? + number(13)?,
+            system: number(12)? + number(14)?,
+        })
     }
 
     /// Kernel threads seen, by pid: skipped while their pid stays listed
@@ -489,6 +538,11 @@ mod imp {
         let ns = |counters: &[usize]| counters.iter().map(|&i| u64::from(to.0[i].wrapping_sub(from.0[i]))).sum::<u64>() * 1_000_000_000 / per_second;
         (ns(&[0, 3]).saturating_sub(own[0]) + ns(&[1]).saturating_sub(own[1]), 0)
     }
+
+    /// macOS lets an account read only its own processes' times: no names.
+    pub fn busiest(_: u64) -> String {
+        String::new()
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
@@ -502,6 +556,10 @@ mod imp {
 
     pub fn other_and_steal_ns(_: CpuTimes, _: CpuTimes, _: [u64; 2]) -> (u64, u64) {
         (0, 0)
+    }
+
+    pub fn busiest(_: u64) -> String {
+        String::new()
     }
 }
 
@@ -546,7 +604,7 @@ mod tests {
     #[test]
     fn a_stat_line_parses_past_its_command() {
         let line = "42 (a) (b) S 7 42 42 0 -1 4194560 100 0 0 0 11 22 33 44 20 0 1 0 5 0 0";
-        assert_eq!(imp::parse_stat(line), Some(imp::Proc { parent: 7, kernel_thread: false, system: 22 + 44 }));
+        assert_eq!(imp::parse_stat(line), Some(imp::Proc { name: "a) (b".into(), parent: 7, kernel_thread: false, user: 11 + 33, system: 22 + 44 }));
         let kthread = "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 9 0 0 20 0 1 0 1 0 0";
         assert!(imp::parse_stat(kthread).unwrap().kernel_thread);
     }
@@ -555,7 +613,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn our_tree_is_ours() {
-        let p = |parent| imp::Proc { parent, kernel_thread: false, system: 0 };
+        let p = |parent| imp::Proc { name: String::new(), parent, kernel_thread: false, user: 0, system: 0 };
         let procs = std::collections::HashMap::from([(1, p(0)), (10, p(1)), (11, p(10)), (12, p(11)), (20, p(1))]);
         assert!(imp::ours(10, 10, &procs) && imp::ours(10, 12, &procs));
         assert!(!imp::ours(10, 20, &procs) && !imp::ours(10, 1, &procs));
