@@ -380,18 +380,25 @@ mod tests {
         assert_eq!(running_cpu_ns(), 0, "none running after the reaping");
     }
 
-    /// The check above can fail: a sibling spinning beside the child, a
-    /// process that run did not start, reads as other programs' load in
-    /// the windows while the child runs.
+    /// The check above can fail: a program spinning beside the child, one
+    /// this process did not start, reads as other programs' load in the
+    /// windows while the child runs. (Started through a shell that exits at
+    /// once, so it leaves this process's tree: on Linux a process this one
+    /// started is its own.)
     #[test]
     fn a_sibling_beside_the_child_reads_as_load() {
         let _one = one();
         let background = background_milli_cpus();
         let before = crate::load::windows().len();
-        let mut sibling = std::process::Command::new("perl").args(["-e", "my $t = time; 1 while time - $t < 4"]).spawn().expect("perl");
+        let out =
+            std::process::Command::new("sh").args(["-c", "perl -e 'my $t = time; 1 while time - $t < 4' >/dev/null 2>&1 & echo $!"]).output().expect("sh");
+        let sibling: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().expect("the orphan's pid");
         let child = run(std::process::Command::new("sleep").arg("3"));
-        sibling.kill().ok();
-        sibling.wait().expect("the sibling");
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // Sound: a signal to the orphan this test started.
+        unsafe { kill(sibling, 9) };
         let windows = crate::load::windows();
         let during: Vec<_> = windows[before..].iter().filter(|w| w.end_ns > child.started_ns && w.start_ns < child.started_ns + child.wall_ns).collect();
         assert!(

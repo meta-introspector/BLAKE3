@@ -4,33 +4,36 @@
 //! **Where.** Linux and macOS ([`MEASURED`]).
 //!
 //! **What it counts.** Other programs' CPU time over a stretch of wall
-//! time, in milli-CPUs (1000: one CPU busy throughout): their user time,
-//! the machine's user and nice time less this process's own user time
-//! (every thread, and the children it has reaped or
-//! [`crate::child::run`] is running); and their system time. On Linux
-//! their system time is summed from each other process's own count
-//! (`/proc/PID/stat`: kernel threads and this process's tree left out); on
-//! macOS, which lets an account read only its own processes' times, it is
-//! the machine's system time less this process's. On Linux the OS also
-//! counts steal time, which a hypervisor took from a VM's CPUs for other
-//! work on the host, load a guest sees no other way.
+//! time, in milli-CPUs (1000: one CPU busy throughout). On Linux, where
+//! /proc lists the whole machine's processes (kernel threads among them),
+//! it is summed from each other process's own count, user and system
+//! (`/proc/PID/stat`, with the children it has waited for; kernel threads
+//! and this process's tree left out). Elsewhere (macOS, which lets an
+//! account read only its own processes; a PID namespace, a container or
+//! firejail, whose /proc lists a few) it is the machine's busy time less
+//! this process's own (every thread, and the children it has reaped or
+//! [`crate::child::run`] is running). On Linux the OS also counts steal
+//! time, which a hypervisor took from a VM's CPUs for other work on the
+//! host, load a guest sees no other way.
 //!
-//! **Why in two parts.** The kernel's work on this process's behalf
-//! (wakes, interrupts, starting and ending the processes it spawns,
-//! cleaning up after them) is system time charged to no process, so the
-//! machine's busy time less ours reads it as other programs' load: on an
-//! EPYC 9255, a cell starting a thousand processes read 0.61 CPUs of it
-//! with nothing else running (BLAKE3 #142). Another program's own system
-//! time is load as real as its user time: reading /dev/urandom in four
-//! processes kept four CPUs busy in system time, and a loop of page
-//! faults moved a cell by 14.5% (bench-hashes #98, Sam Shackleton and
-//! Devon Jonte). Linux charges that time to the program; the sum counts
-//! it and leaves the kernel's work for us out. On macOS the kernel's work
-//! for us stays in: on an M4 Max it read 0.1-0.25 CPUs beside a quiet
-//! machine's own 0.3 (probes, the fork's branch probe/mac-load, Mac jobs
-//! 1793-1795), under [`BUSY_MILLI_CPUS`]. Inside a PID namespace (a
-//! container, firejail) the sum sees only the namespace's processes; the
-//! user time is the whole machine's.
+//! **Why a sum where Linux allows one.** The machine's busy time less ours
+//! misreads in two ways. The kernel's work on this process's behalf
+//! (wakes, interrupts, starting and reaping the processes it spawns) is
+//! charged to no process: a cell starting a thousand processes read 0.61
+//! CPUs of others' load on an EPYC 9255 with nothing else running (BLAKE3
+//! #142). And the machine counts in ticks of 10 ms a CPU where this
+//! process's own time is exact, and splits its time into user and system
+//! by sampling: on a 2x Xeon Gold 6330 (112 CPUs), with this process
+//! keeping every CPU busy, the difference read 1-6 CPUs of others' load in
+//! windows where no other process took 0.5 CPUs (bench-hashes #98, Sam
+//! Shackleton). Another program's own time, user or system, is what the
+//! sum counts: four readers of /dev/urandom (system time) read 4.0, as four
+//! spinners (user time) do. On macOS the difference is the one reading
+//! available; on an M4 Max the kernel's work for us read 0.1-0.25 CPUs
+//! beside a quiet machine's 0.3 (the fork's probe/mac-load, Mac jobs
+//! 1793-1795), under [`BUSY_MILLI_CPUS`], on 16 CPUs, whose ticks err by
+//! 0.16 CPUs at most. Inside a PID namespace the difference keeps #142's
+//! misreading.
 //!
 //! **When it reads.** A reading costs system calls, which take far longer
 //! than a short timed call, so it never happens inside a timed interval
@@ -334,16 +337,17 @@ pub fn describe(windows: &[Window]) -> String {
 mod imp {
     use std::collections::HashMap;
 
-    /// CPU times in ticks, all CPUs summed: the machine's user and nice
-    /// time (a guest's is inside it) and its steal; and `others`, the
-    /// system time of every process /proc lists but kernel threads and this
-    /// one's tree, each with that of the children it has waited for (so a
-    /// short-lived program still counts, in its parent's).
+    /// CPU times in ticks, all CPUs summed: the machine's busy time (user,
+    /// nice, system, irq, softirq; a guest's is inside user) and its steal;
+    /// and `others`, where /proc lists kernel threads (the whole machine),
+    /// the user and system time of every process but kernel threads and
+    /// this one's tree, each with that of the children it has waited for
+    /// (so a short-lived program still counts, in its parent's).
     #[derive(Clone, Copy)]
     pub struct CpuTimes {
-        pub(super) user: u64,
+        pub(super) busy: u64,
         pub(super) steal: u64,
-        pub(super) others: u64,
+        pub(super) others: Option<u64>,
     }
 
     fn ticks_per_second() -> u64 {
@@ -361,11 +365,11 @@ mod imp {
             stat.lines().next()?.strip_prefix("cpu ")?.split_whitespace().map(|field| field.parse().expect("/proc/stat counts are integers")).collect();
         // user nice system idle iowait irq softirq steal (guest time is inside user).
         assert!(fields.len() >= 8, "/proc/stat's cpu line has at least eight fields");
-        let procs = scan()?;
+        let (procs, whole) = scan()?;
         let me = std::process::id();
-        let others = procs.iter().filter(|&(&pid, _)| !ours(me, pid, &procs)).map(|(_, p)| p.system).sum();
+        let others = whole.then(|| procs.iter().filter(|&(&pid, _)| !ours(me, pid, &procs)).map(|(_, p)| p.user + p.system).sum());
         note_busiest(&procs, me);
-        Some(CpuTimes { user: fields[0] + fields[1], steal: fields[7], others })
+        Some(CpuTimes { busy: fields[0] + fields[1] + fields[2] + fields[5] + fields[6], steal: fields[7], others })
     }
 
     /// Each other process's CPU time at the last reading (name, ticks), and
@@ -441,9 +445,11 @@ mod imp {
     static KERNEL_THREADS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
 
     /// /proc's processes but kernel threads (a process gone between the
-    /// listing and its stat is skipped). A reading costs 0.24 ms on the
-    /// EPYC 9255's 574 processes, once a window, outside timed intervals.
-    fn scan() -> Option<HashMap<u32, Proc>> {
+    /// listing and its stat is skipped), and whether any kernel thread was
+    /// listed: /proc shows the whole machine, not a PID namespace's few. A
+    /// reading costs 0.24 ms on the EPYC 9255's 574 processes, once a
+    /// window, outside timed intervals.
+    fn scan() -> Option<(HashMap<u32, Proc>, bool)> {
         let mut kernel = KERNEL_THREADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let kernel = kernel.get_or_insert_with(Default::default);
         let mut listed = std::collections::HashSet::new();
@@ -473,7 +479,7 @@ mod imp {
             }
         }
         kernel.retain(|pid| listed.contains(pid));
-        Some(procs)
+        Some((procs, !kernel.is_empty()))
     }
 
     /// Whether `pid` is `me` or descends from it in `procs`.
@@ -493,14 +499,18 @@ mod imp {
     }
 
     /// Other programs' CPU time and the steal between two readings, in ns:
-    /// the machine's user time less this process's (`own`: user, system),
-    /// and the others' system time. Tick rounding can put the machine's
-    /// user time a little under ours, and a program that exits unwaited
-    /// for takes its system time out of the sum; each reads as none.
+    /// the others' sum where both readings saw the whole machine, else the
+    /// machine's busy time less this process's (`own`: user, system). A
+    /// program that exits unwaited for takes its time out of the sum, and
+    /// tick rounding can put the machine's busy time a little under ours;
+    /// each reads as none.
     pub fn other_and_steal_ns(from: CpuTimes, to: CpuTimes, own: [u64; 2]) -> (u64, u64) {
         let ns = |ticks: u64| ticks * 1_000_000_000 / ticks_per_second();
-        let user = ns(to.user - from.user).saturating_sub(own[0]);
-        (user + ns(to.others.saturating_sub(from.others)), ns(to.steal - from.steal))
+        let other = match (from.others, to.others) {
+            (Some(was), Some(now)) => ns(now.saturating_sub(was)),
+            _ => ns(to.busy - from.busy).saturating_sub(own[0] + own[1]),
+        };
+        (other, ns(to.steal - from.steal))
     }
 }
 
@@ -527,16 +537,17 @@ mod imp {
     }
 
     /// Other programs' CPU time between two readings, in ns: the machine's
-    /// user and nice time less this process's user time, and its system
-    /// time less this process's (`own`: user, system); tick rounding can
-    /// put either a little under ours, which reads as none. No steal.
+    /// busy time (user, nice, system) less this process's (`own`: user,
+    /// system), in one subtraction, so that how either side splits its time
+    /// into user and system cannot read as load; tick rounding can put the
+    /// machine's a little under ours, which reads as none. No steal.
     pub fn other_and_steal_ns(from: CpuTimes, to: CpuTimes, own: [u64; 2]) -> (u64, u64) {
         const SC_CLK_TCK: i32 = 3;
         // Sound: a plain query.
         let per_second = u64::try_from(unsafe { sysconf(SC_CLK_TCK) }).expect("sysconf(_SC_CLK_TCK) is positive");
         // Each counter wraps on its own: difference each, then sum.
-        let ns = |counters: &[usize]| counters.iter().map(|&i| u64::from(to.0[i].wrapping_sub(from.0[i]))).sum::<u64>() * 1_000_000_000 / per_second;
-        (ns(&[0, 3]).saturating_sub(own[0]) + ns(&[1]).saturating_sub(own[1]), 0)
+        let busy: u64 = [0, 1, 3].iter().map(|&i| u64::from(to.0[i].wrapping_sub(from.0[i]))).sum();
+        ((busy * 1_000_000_000 / per_second).saturating_sub(own[0] + own[1]), 0)
     }
 
     /// macOS lets an account read only its own processes' times: no names.
@@ -621,10 +632,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn tail_fixture(busy: u64, steal: u64, tail_busy: u64, tail_steal: u64) -> State {
-        let start = Reading { at_ns: 0, machine: imp::CpuTimes { user: 0, steal: 0, others: 0 }, own_ns: [0, 0] };
-        let last = Reading { at_ns: WINDOW_NS, machine: imp::CpuTimes { user: busy, steal, others: 0 }, own_ns: [0, 0] };
+        let start = Reading { at_ns: 0, machine: imp::CpuTimes { busy: 0, steal: 0, others: None }, own_ns: [0, 0] };
+        let last = Reading { at_ns: WINDOW_NS, machine: imp::CpuTimes { busy, steal, others: None }, own_ns: [0, 0] };
         let mut state = State { last: Some(last), last_start: None, windows: vec![between(start, last)] };
-        let tail = Reading { at_ns: WINDOW_NS + 400_000_000, machine: imp::CpuTimes { user: tail_busy, steal: tail_steal, others: 0 }, own_ns: [0, 0] };
+        let tail = Reading { at_ns: WINDOW_NS + 400_000_000, machine: imp::CpuTimes { busy: tail_busy, steal: tail_steal, others: None }, own_ns: [0, 0] };
         join_tail(&mut state, start, tail);
         state
     }
@@ -676,11 +687,12 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn apple_counters_wrap_one_by_one() {
-        // User wraps; nice counts with it; system less ours; idle is none.
+        // User wraps; nice and system count with it; idle is none; ours
+        // comes off the total, however it splits.
         let from = imp::CpuTimes([u32::MAX - 9, 0, 0, 5]);
         let to = imp::CpuTimes([10, 20, 1000, 7]);
-        let (other, _) = imp::other_and_steal_ns(from, to, [20_000_000, 50_000_000]);
-        assert_eq!(other, (22 - 2) * 10_000_000 + (20 - 5) * 10_000_000);
+        let (other, _) = imp::other_and_steal_ns(from, to, [300_000_000, 0]);
+        assert_eq!(other, (20 + 2 + 20) * 10_000_000 - 300_000_000);
     }
 
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
