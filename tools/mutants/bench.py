@@ -1,7 +1,7 @@
 """Benchmark the mutants this machine's survivor list calls speed-only
 (Zooko, October 26; BLAKE3 #183).
 
-    python3 tools/mutants/bench.py [--since REV] [--pairs N] [--re PATTERN]
+    python3 tools/mutants/bench.py [--since REV] [--layouts N] [--re PATTERN]
 
 A row whose reason starts "speed" or "equally correct" says its mutant is
 correct either way and faster one way: a claim a benchmark can test. Each
@@ -15,8 +15,9 @@ the cells that run its changed lines. Its verdict, one line a place:
     no cell runs it  code no benchmark measures: a cell to write, or code to delete
     no verdict       the machine was busy: run again
 
-A "faster" or "no cell slower" is a reading at N pairs (default 8):
-rerun it at 23 (--pairs 23) before acting on it. Places come from
+A "faster" or "no cell slower" is a reading at N links a side, each
+run twice (default 4, check's: 8 pairs): rerun it at 12 (--layouts 12,
+24 pairs) before acting on it. Places come from
 check.py's last full run (tmp/mutants-last/run/tests.tsv): a place any
 test failed, crashed or timed out on is caught, and is skipped (a caught
 place can crash the benchmark). --since REV takes only the rows the lists
@@ -101,7 +102,7 @@ def git(*args, **kw):
 def main():
     args = sys.argv[1:]
     take = lambda flag: args[args.index(flag) + 1] if flag in args else None
-    pairs, since, pattern = take("--pairs") or "8", take("--since"), take("--re")
+    layouts, since, pattern = take("--layouts") or "4", take("--since"), take("--re")
     lines = open(check.KNOWN).readlines()
     rows = speed_rows(lines)
     if since is not None:
@@ -124,13 +125,13 @@ def main():
     git("-C", tree, "checkout", "-q", "--detach", head)
     bench = bench_dir(os.environ, check.ROOT)
     assert os.path.exists(os.path.join(bench, "Cargo.toml")), f"no bench-hashes checkout at {bench} (clone it beside this checkout, or set BENCH_HASHES_DIR)"
-    print(f"bench: {len(rows)} rows claim speed alone, at {head[:12]}; {pairs} pairs a place", flush=True)
+    print(f"bench: {len(rows)} rows claim speed alone, at {head[:12]}; {layouts} links a side a place", flush=True)
     for row in rows:
         for m in surviving(mutants, row, caught):
             place = m["name"].split(": ", 1)[0].split(":", 1)[1]
             subprocess.run(["patch", "-s", os.path.join(tree, row[0])], input=m["diff"], text=True, check=True)
             try:
-                run = subprocess.run(["cargo", "run", "-q", "--release", "--", "check", "--fork", tree, "--against", head, "--pairs", pairs],
+                run = subprocess.run(["cargo", "run", "-q", "--release", "--", "check", "--fork", tree, "--against", head, "--layouts", layouts],
                                      cwd=bench, capture_output=True, text=True)
             finally:
                 git("-C", tree, "checkout", "-q", "--", row[0])

@@ -18,11 +18,11 @@ at most 7200):
 (bench-hashes before its git dependency on the fork took `--thorough` for
 a full run; later ones run in full by default and take `--quick`.)
     {"type": "check", "old_commit": "...", "new_commit": "...",
-     "bench_commit": "...", "old_bench_commit": "...", "cells": "all", "pairs": N}
+     "bench_commit": "...", "old_bench_commit": "...", "cells": "all", "layouts": N}
 
 (bench-hashes check measures the cells whose code the change touches, or
-every cell with "cells": "all"; "pairs" is the pairs of runs, its default
-check's. "old_bench_commit" builds the old side with the bench at that
+every cell with "cells": "all"; "layouts" is the links a side, each run
+twice, its default check's. "old_bench_commit" builds the old side with the bench at that
 commit (check --old-bench), for an old side that predates the bench's
 calls: 0.8 against the main line before the performance API. Every run's
 samples file lands in the job's samples/.)
@@ -250,9 +250,9 @@ def check(job, run, work, out):
         cmd += ["--cells", "all"]
     elif "cells" in job:
         raise AssertionError("cells: \"all\", or left out (the cells the change touches)")
-    if "pairs" in job:
-        assert isinstance(job["pairs"], int) and job["pairs"] >= 3, "pairs: 3 or more"
-        cmd += ["--pairs", str(job["pairs"])]
+    if "layouts" in job:
+        assert isinstance(job["layouts"], int) and job["layouts"] >= 2, "layouts: 2 or more"
+        cmd += ["--layouts", str(job["layouts"])]
     if "old_bench_commit" in job:
         cmd += ["--old-bench", hex_commit(job, "old_bench_commit")]
     try:
