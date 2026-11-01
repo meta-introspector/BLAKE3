@@ -85,7 +85,7 @@ static RUNNING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new
 /// The user and system time of the child [`run`] is running, so far (0
 /// for none).
 #[cfg(unix)]
-fn running_times_ns() -> [u64; 2] {
+pub(crate) fn running_times_ns() -> [u64; 2] {
     match RUNNING.load(std::sync::atomic::Ordering::SeqCst) {
         0 => [0, 0],
         pid => imp::cpu_so_far_ns(pid),
@@ -96,13 +96,6 @@ fn running_times_ns() -> [u64; 2] {
 #[cfg(unix)]
 pub(crate) fn running_cpu_ns() -> u64 {
     running_times_ns().iter().sum()
-}
-
-/// The user time of the child [`run`] is running, so far (0 for none):
-/// [`crate::load`]'s share of this process's own.
-#[cfg(unix)]
-pub(crate) fn running_user_ns() -> u64 {
-    running_times_ns()[0]
 }
 
 /// While the child `pid` runs: mark it running, and tick the load windows
@@ -159,10 +152,10 @@ pub(crate) fn rusage_cpu_ns(words: &[i64; 18]) -> u64 {
     rusage::cpu_ns(words)
 }
 
-/// A `struct rusage`'s user time, as 64-bit words.
+/// A `struct rusage`'s user and system time, as 64-bit words.
 #[cfg(unix)]
-pub(crate) fn rusage_user_ns(words: &[i64; 18]) -> u64 {
-    rusage::user_ns(words)
+pub(crate) fn rusage_times_ns(words: &[i64; 18]) -> [u64; 2] {
+    rusage::times_ns(words)
 }
 
 #[cfg(unix)]
@@ -195,8 +188,8 @@ mod rusage {
         timeval_ns(w[0], w[1]) + timeval_ns(w[2], w[3])
     }
 
-    pub(crate) fn user_ns(w: &Words) -> u64 {
-        timeval_ns(w[0], w[1])
+    pub(crate) fn times_ns(w: &Words) -> [u64; 2] {
+        [timeval_ns(w[0], w[1]), timeval_ns(w[2], w[3])]
     }
 
     pub fn max_rss_bytes(w: &Words) -> u64 {
