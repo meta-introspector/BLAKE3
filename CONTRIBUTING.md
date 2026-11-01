@@ -253,8 +253,10 @@ lists what it takes and ticks each step:
    the VM and the Mac: each commit was checked against its parent alone,
    and this sees what small slowdowns add up to. When the old side
    predates the bench's calls, `--old-bench <bench commit>` builds it with
-   a bench that calls it the same way (0.8 against the main line before
-   the performance API: 5be5f236; the runner's "old_bench_commit").
+   a bench that calls it the same way (the runner's "old_bench_commit").
+   That bench must build beside the fork, as every bench from 1f4dfd63 on
+   does; one from before the two became separate checkouts (0.18.3 and
+   older) builds only inside it, and `check` says so.
 4. The long proofs, every kernel; the full mutation run.
 5. A paired package dry-run (below). The CLI needs the new library version,
    which is not on crates.io yet; checking it alone cannot validate the pair.
