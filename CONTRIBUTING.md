@@ -104,7 +104,7 @@ paths") is a claim a benchmark can test. `python3 tools/mutants/bench.py
 [--since REV]` applies each surviving place alone and runs `bench-hashes
 check` on it, about ten minutes a place. Slower: the path earns its
 place. No cell runs it: a benchmark cell to write, or code to delete.
-No cell slower, or faster: read it again at `--layouts 12`, then a
+No cell slower, or faster: read it again at `--layouts 24`, then a
 candidate to delete, or an improvement.
 
 A survivor no test can kill is first a line to consider removing: an

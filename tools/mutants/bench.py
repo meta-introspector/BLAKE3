@@ -15,9 +15,9 @@ the cells that run its changed lines. Its verdict, one line a place:
     no cell runs it  code no benchmark measures: a cell to write, or code to delete
     no verdict       the machine was busy: run again
 
-A "faster" or "no cell slower" is a reading at N links a side, each
-run twice (default 4, check's: 8 pairs): rerun it at 12 (--layouts 12,
-24 pairs) before acting on it. Places come from
+A "faster" or "no cell slower" is a reading at N links a side, a pair
+each (default 4, check's): rerun it at 24 (--layouts 24) before acting
+on it. Places come from
 check.py's last full run (tmp/mutants-last/run/tests.tsv): a place any
 test failed, crashed or timed out on is caught, and is skipped (a caught
 place can crash the benchmark). --since REV takes only the rows the lists

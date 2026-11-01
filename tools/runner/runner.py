@@ -21,8 +21,8 @@ a full run; later ones run in full by default and take `--quick`.)
      "bench_commit": "...", "old_bench_commit": "...", "cells": "all", "layouts": N}
 
 (bench-hashes check measures the cells whose code the change touches, or
-every cell with "cells": "all"; "layouts" is the links a side, each run
-twice, its default check's. "old_bench_commit" builds the old side with the bench at that
+every cell with "cells": "all"; "layouts" is the links a side, a pair
+each, its default check's. "old_bench_commit" builds the old side with the bench at that
 commit (check --old-bench), for an old side that predates the bench's
 calls: 0.8 against the main line before the performance API. Every run's
 samples file lands in the job's samples/.)
