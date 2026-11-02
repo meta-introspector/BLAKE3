@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""cargo-nextest, narrowed to the tests a mutant can reach (check.py).
+
+check.py puts this file's directory first on PATH for a mutation run, so
+cargo-mutants' `cargo nextest run ...` arrives here. The worktree holds
+one mutant (cargo-mutants --in-place): its diff against HEAD names the
+lines it changed, and the map of the tests' lines (tools/tests/reach.py,
+tmp/tests-map/<tree id>.tsv for HEAD's tree) names the tests that ran
+them. Those tests run, through the real cargo-nextest, with a filterset;
+the rest cannot see the mutant. Where the rule says every test (a change
+outside a function, or no map for HEAD's tree), every test runs, as
+without this file. The outcome a mutant gets is the same as the whole
+suite's would be, in a fraction of the time: the mutant's tests alone.
+
+Every other invocation (list, --no-run) passes straight through.
+"""
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, os.path.join(ROOT, "tools", "tests"))
+
+
+def real_nextest():
+    """The cargo-nextest after this one on PATH."""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = os.path.join(d, "cargo-nextest")
+        if os.path.isfile(candidate) and os.path.realpath(candidate) != os.path.realpath(__file__):
+            return candidate
+    sys.exit("cargo-nextest: no real cargo-nextest on PATH after the shim")
+
+
+def narrowed(args):
+    """The filterset for the mutant in the worktree, or None for every test."""
+    import reach
+    tree = subprocess.run(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True, check=True).stdout.strip()
+    if not os.path.exists(reach.map_path(tree)):
+        return None
+    reach._BASE["commit"] = tree
+    base_tests, instrumented = reach.read_map(tree)
+    diff = reach.hunks(tree)
+    listed = list(base_tests)
+    chosen, everything = reach.select(base_tests, instrumented, listed, diff)
+    if everything:
+        return None
+    if not chosen:
+        # No test ran a changed line: nothing can see the mutant. One test
+        # runs so that cargo-mutants sees a passing run (a filterset that
+        # matches nothing is an error to nextest), and the mutant survives,
+        # as the whole suite would let it.
+        t = sorted(listed)[0]
+        return f"(binary_id(={t.split(' ', 1)[0]}) & test(={t.split(' ', 1)[1]}))"
+    return " | ".join(f"(binary_id(={t.split(' ', 1)[0]}) & test(={t.split(' ', 1)[1]}))" for t in sorted(chosen))
+
+
+def main():
+    args = sys.argv[1:]
+    # cargo invokes `cargo-nextest nextest run ...`.
+    command = [real_nextest(), *args]
+    is_run = len(args) >= 2 and args[0] == "nextest" and args[1] == "run" and "--no-run" not in args
+    if is_run and os.environ.get("MUTANTS_REACH") == "1":
+        try:
+            expr = narrowed(args)
+        except Exception as error:  # a failure to narrow is no reason to misjudge: every test
+            print(f"cargo-nextest shim: every test ({error})", file=sys.stderr)
+            expr = None
+        if expr is not None:
+            # Before the `--` that separates nextest's arguments from the tests'.
+            at = args.index("--") if "--" in args else len(args)
+            command = [real_nextest(), *args[:at], "-E", expr, *args[at:]]
+    os.execv(command[0], command)
+
+
+if __name__ == "__main__":
+    main()

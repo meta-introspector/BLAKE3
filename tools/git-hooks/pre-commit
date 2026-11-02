@@ -1,0 +1,41 @@
+#!/bin/sh
+# blake3-servil pre-commit hook, for commits that touch code:
+# 1. the tests the change reaches (tools/tests/reach.py check: the tests
+#    that ran a changed line, by line coverage and the diff; everything
+#    where coverage cannot see the change), a few seconds; a failure
+#    aborts the commit. With no map yet (tmp/tests-map), it says so and
+#    runs on: `python3 tools/tests/reach.py map` makes one in a minute.
+# 2. the performance-regression check (the working tree against HEAD:
+#    `bench-hashes check`, which measures the cells whose code the commit
+#    touches). A confirmed regression (exit 1) aborts the commit; no
+#    verdict (exit 2: other programs kept the machine busy) warns and lets
+#    it through.
+# `git commit --no-verify` skips both after review.
+#
+# Both measure the working tree, which is what is being committed when
+# the index holds all of it (git commit -a).
+#
+# Install: sh tools/install-git-hooks.sh (the VM's vm/setup.sh does it).
+code=$(git diff --cached --name-only -- src c tests build.rs Cargo.toml Cargo.lock .config)
+[ -z "$code" ] && exit 0
+top=$(git rev-parse --show-toplevel)
+if [ -e "$top/tmp/tests-map/latest" ]; then
+    python3 "$top/tools/tests/reach.py" check || { echo "pre-commit: a test the change reaches fails; commit aborted. After review, git commit --no-verify overrides."; exit 1; }
+else
+    echo "pre-commit: no map of the tests' lines yet (python3 tools/tests/reach.py map, a minute); the tests are not run here."
+fi
+code=$(git diff --cached --name-only -- src c build.rs Cargo.toml Cargo.lock)
+[ -z "$code" ] && exit 0
+# The bench's checkout: beside this one (../bench-hashes), or where
+# BENCH_HASHES_DIR names. git hands a hook GIT_DIR and GIT_INDEX_FILE,
+# naming this checkout; the check runs git in checkouts of its own, so it
+# runs without them.
+bench=${BENCH_HASHES_DIR:-$top/../bench-hashes}
+[ -f "$bench/Cargo.toml" ] || { echo "pre-commit: no bench-hashes checkout at $bench (clone it beside this checkout, or set BENCH_HASHES_DIR); commit aborted"; exit 1; }
+(cd "$bench" && env -u GIT_DIR -u GIT_INDEX_FILE cargo run --release --quiet -- check --fork "$top")
+verdict=$?
+case $verdict in
+0) exit 0 ;;
+2) echo "pre-commit: the performance check gave no verdict (above); committing. Check again on a quiet machine."; exit 0 ;;
+*) echo "pre-commit: performance regression; commit aborted. After review, git commit --no-verify overrides."; exit 1 ;;
+esac

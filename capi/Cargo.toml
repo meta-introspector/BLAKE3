@@ -1,0 +1,42 @@
+[package]
+name = "blake3-servil-c"
+version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
+description = "BLAKE3, the servil fork's C API (b3.h)"
+edition = "2024"
+license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
+publish = false
+
+[lib]
+name = "b3_servil"
+
+[dependencies]
+blake3-servil = { path = ".." }
+
+[features]
+capi = []
+
+[package.metadata.capi]
+min_version = "0.10.26"
+
+[package.metadata.capi.header]
+name = "b3"
+subdirectory = ""
+generation = false
+
+[package.metadata.capi.install.include]
+asset = [{ from = "b3.h", to = "" }]
+
+[package.metadata.capi.library]
+name = "b3_servil"
+version_suffix_components = 2
+
+[package.metadata.capi.pkg_config]
+name = "b3_servil"
+filename = "b3_servil"
+
+[dev-dependencies]
+serde_json = "1"
+libc = "0.2"
+
+[profile.release]
+panic = "abort"

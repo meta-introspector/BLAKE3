@@ -1,0 +1,39 @@
+#!/bin/sh
+# cargo's target runner for a mutation run's test binaries (check.py):
+# each test process may hold MUTANTS_TEST_DATA_KIB of data (RLIMIT_DATA),
+# its own cap, well under the builds' (check.py, test_limits).
+ulimit -d "$MUTANTS_TEST_DATA_KIB" || exit 101
+# Same code (check.py, SAME_CODE): nextest lists every test binary, each
+# through this runner, before it runs a test; the listing records each
+# binary's path and file (inode, mtime, size). A build's first test then
+# asks code_hash.py --verdict once, under the state's lock: the shard's
+# first build is the unmutated one, whose hashes it records ("baseline");
+# a later one is "same" when every binary hashes as that build's. The
+# build's files name the verdict, so the build's other tests reuse it.
+# On "same" the mutant changed nothing this machine runs: the test exits
+# at once with MARKER, which check.py reads in the mutant's log, and no
+# test runs. Anything else runs the tests as ever.
+state=$MUTANTS_SAME_CODE
+if [ -n "$state" ]; then
+	name=$(basename "$1")
+	case " $* " in
+	*" --list "*)
+		echo "$1" > "$state/$name.path"
+		stat -c '%i %.9Y %s' "$1" > "$state/$name.stat" || exit 101
+		;;
+	*)
+		key=$(cat "$state"/*.stat | cksum) || exit 101
+		verdict=$(flock "$state/lock" sh -c '
+			if [ "$(cat "$1/verdict.key" 2>/dev/null)" != "$2" ]; then
+				python3 "$MUTANTS_CODE_HASH" --verdict "$1" > "$1/verdict" || exit 101
+				echo "$2" > "$1/verdict.key"
+			fi
+			cat "$1/verdict"' sh "$state" "$key") || exit 101
+		if [ "$verdict" = same ]; then
+			echo "$MUTANTS_SAME_CODE_MARKER" >&2
+			exit 99
+		fi
+		;;
+	esac
+fi
+exec "$@"

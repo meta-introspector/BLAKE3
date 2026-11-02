@@ -1,139 +1,122 @@
 [package]
-name = "blake3"
-version = "1.8.7"
-authors = ["Jack O'Connor <oconnor663@gmail.com>", "Samuel Neves"]
-description = "the BLAKE3 hash function"
-repository = "https://github.com/BLAKE3-team/BLAKE3"
+name = "blake3-servil"
+# The fork's own version series, from 0.1.0, based on upstream BLAKE3 1.8.7:
+# tools/gen-ver.py sets X.Y.Z+<commit> here and tags vX.Y.Z+<commit>.
+version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
+authors = ["Jack O'Connor <oconnor663@gmail.com>", "Samuel Neves", "John Servil"]
+description = "the BLAKE3 hash function, with SME2 and integer + NEON kernels for AArch64 and a shared thread pool"
+repository = "https://github.com/johnservil/BLAKE3"
 license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
-documentation = "https://docs.rs/blake3"
 readme = "README.md"
 edition = "2024"
+# What a build from crates.io needs: the library, its assembly and build
+# script, the pages users read, the licences, and the file the tests include.
+include = ["/src", "/c", "/build.rs", "/README.md", "/CHANGELOG.md", "/QUALITY.md", "/LICENSE_*", "/tools/require_nextest.rs"]
 
 [features]
 default = ["std"]
 
-# The NEON implementation does not participate in dynamic feature detection,
-# which is currently x86-only. If "neon" is on, NEON support is assumed. Note
-# that AArch64 always supports NEON, but support on ARMv7 varies. The NEON
-# implementation uses C intrinsics and requires a C compiler.
-neon = []
-
-# The Wasm SIMD implementation does not participate in dynamic feature detection,
-# which is currently x86-only. If "wasm_simd" is on, Wasm SIMD support is assumed.
-# Note that not all Wasm implementations support the Wasm SIMD specification.
-# This may become the default in the future.
-wasm32_simd = []
-
 # Enables std::io traits, including impl Write for Hasher, impl Read and Seek
 # for OutputReader, and the Hasher::update_reader method. This feature is
 # enabled by default. (Previously this also controlled runtime CPU feature
-# detection on x86, but now we use the no-std-compatible `cpufeatures` crate
-# for that.)
+# detection on x86, which now reads CPUID directly, with or without std.)
 # Also enables the `std` feature of the `constant_time_eq` dependency, which
 # toggles a runtime feature check on 64-bit ARM targets.
 std = ["constant_time_eq/std"]
 
-# The `rayon` feature (disabled by default, but enabled for docs.rs) adds the
-# `update_rayon` and (in combination with `mmap` below) `update_mmap_rayon`
-# methods, for multithreaded hashing. However, even if this feature is enabled,
-# all other APIs remain single-threaded.
-#
-# Implementation detail: We take a dependency on rayon-core instead of rayon,
-# because it builds faster and still includes all the APIs we need.
-rayon = ["dep:rayon-core"]
-
-# The `mmap` feature (disabled by default, but enabled for docs.rs) adds the
-# `update_mmap` and (in combination with `rayon` above) `update_mmap_rayon`
-# helper methods for memory-mapped IO.
-mmap = ["std", "dep:memmap2"]
-
 # Implement the zeroize::Zeroize trait for types in this crate.
 zeroize = ["dep:zeroize", "arrayvec/zeroize"]
 
-# This crate implements traits from the RustCrypto project, exposed here as the
-# "traits-preview" feature. However, these traits aren't stable, and they're
-# expected to change in incompatible ways before they reach 1.0. For that
-# reason, this crate makes no SemVer guarantees for this feature, and callers
-# who use it should expect breaking changes between patch versions of this
-# crate. (The "*-preview" feature name follows the conventions of the RustCrypto
-# "signature" crate.)
-traits-preview = ["dep:digest"]
-
-# ---------- Features below this line are undocumented and unstable. ----------
-# The following features are mainly intended for testing and benchmarking, and
-# they might change or disappear at any time without a major version bump.
-
-# It wasn't originally intended to expose "digest" as its own feature, but the
-# traits-preview feature above predated the "dep:" syntax in Cargo. Version
-# 1.5.2 of this crate started using "dep:" syntax, but that broke some callers
-# in the wild (https://solana.stackexchange.com/q/17787/29050). This feature
-# unbreaks those callers. When Cargo gains the ability to deprecate features,
-# this feature will be deprecated. Note that the relevant trait implementations
-# are still gated by "traits-preview".
-digest = ["dep:digest"]
-
-# By default on x86_64, this crate uses Samuel Neves' hand-written assembly
-# implementations for SSE4.1, AVX2, and AVX512. (These provide both the best
-# runtime performance, and the fastest build times.) And by default on 32-bit
-# x86, this crate uses Rust intrinsics implementations for SSE4.1 and AVX2, and
-# a C intrinsics implementation for AVX-512. In both cases, if a C compiler is
-# not detected, or if AVX-512 support is missing from the detected compiler,
-# build.rs automatically falls back to a pure Rust build. This feature forces
-# that fallback, for testing purposes. (Note that in CI testing, we set the
-# BLAKE3_CI environment variable, which instructs build.rs to error out rather
-# than doing an automatic fallback.)
-pure = []
-
-# As described above, on x86_64 this crate use assembly implementations by
-# default. Enabling the "prefer_intrinsics" feature makes this crate use
-# intrinsics implementations on both 32-bit and 64-bit x86, again for testing
-# purposes.
-prefer_intrinsics = []
-
-# Disable individual instruction sets. CI testing uses these flags to simulate
-# different levels of hardware SIMD support. Note that code for the
-# corresponding instruction set is still compiled; only detection is disabled.
-#
-# As noted above, these flags are *for testing only* and are not stable. It's
-# possible that some users might find that their particular use case performs
-# better if e.g. AVX-512 is disabled, because of issues like CPU downclocking.
-# If that comes up, and if disabling the instruction set here at the feature
-# level turns out to be the right approach, then we can design a stable
-# feature. Until then, we reserve the right to break these features in a patch
-# release.
-no_sse2 = []
-no_sse41 = []
-no_avx2 = []
-no_avx512 = []
-no_neon = []
-
 [package.metadata.docs.rs]
-# Document the rayon/mmap methods and the Serialize/Deserialize/Zeroize impls on docs.rs.
-features = ["mmap", "rayon", "serde", "zeroize"]
+# Document the Serialize/Deserialize/Zeroize impls on docs.rs.
+features = ["serde", "zeroize"]
+
+# The integration tests exercise the pool and the queue, which need std.
+[[test]]
+name = "api_plan"
+required-features = ["std"]
+
+[[test]]
+name = "stream_one_cpu"
+required-features = ["std"]
+
+[[test]]
+name = "forked_child"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_no_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_one_worker"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_parked_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_finish_parked_workers"
+required-features = ["std"]
+
+[[test]]
+name = "stream_collect_with_workers"
+required-features = ["std"]
+
+[[test]]
+name = "initialize_multithreaded_contract"
+required-features = ["std"]
 
 [dependencies]
 arrayvec = { version = "0.7.4", default-features = false }
 constant_time_eq = { version = "0.4.2", default-features = false }
 cfg-if = "1.0.0"
-digest = { version = "0.11.2", features = ["mac"], optional = true }
-memmap2 = { version = "0.9", optional = true }
-rayon-core = { version = "1.12.1", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
 zeroize = { version = "1", default-features = false, optional = true }
 
-[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
-cpufeatures = "0.3.0"
+[target.'cfg(all(target_arch = "aarch64", any(target_vendor = "apple", target_os = "linux")))'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+# The guard-page tests (src/test.rs) on x86-64 too.
+[target.'cfg(all(target_arch = "x86_64", any(target_vendor = "apple", target_os = "linux")))'.dev-dependencies]
+libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
+# Official BLAKE3, the tests' independent implementation: it generates their
+# fixed expected values (BLAKE3_GOLDEN=1, src/test.rs's `golden`), and the
+# co-linking test checks its native symbols never replace ours.
+blake3 = { version = "=1.8.7", default-features = false, features = ["std"] }
+rand = "0.10.0"
 hmac = "0.13.0"
 hex = "0.4.2"
-page_size = "0.6.0"
-rand = "0.10.0"
-chacha20 = "0.10.0"
-reference_impl = { path = "./reference_impl" }
+clocks = { path = "./clocks" }
 tempfile = "3.8.0"
 serde_json = "1.0.107"
 ciborium = "0.2.2"
+# tests/shuttle_*.rs: the pool's handshakes under a model checker.
+shuttle = "0.8"
 
 [build-dependencies]
 cc = "1.1.12"
+
+# Tests built as users' release build is (opt-level 3, 16 codegen units,
+# no incremental compilation, no debug info), with its checks on: debug
+# assertions and overflow checks, which name a broken assumption where
+# users' build would pass it silently. `cargo test --release` runs users'
+# build exactly.
+[profile.test]
+opt-level = 3
+codegen-units = 16
+incremental = false
+debug = false
+debug-assertions = true
+overflow-checks = true
+
+# Mutation testing (tools/mutants/check.py) builds what users run: a mutant
+# that only a debug assertion or an overflow check would catch is uncaught
+# in a release. Built incrementally, since cargo-mutants rebuilds the crate
+# once per mutant (opt-level 1 made a whole run no faster, October 21).
+[profile.mutants]
+inherits = "release"
+incremental = true

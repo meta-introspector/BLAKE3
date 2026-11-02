@@ -1,25 +1,31 @@
+# Published as b3sums (b3sum is official BLAKE3's on crates.io); the
+# program it installs is b3sum.
 [package]
-name = "b3sum"
-version = "1.8.7"
-authors = ["Jack O'Connor <oconnor663@gmail.com>"]
-description = "a command line implementation of the BLAKE3 hash function"
-repository = "https://github.com/BLAKE3-team/BLAKE3"
+name = "b3sums"
+version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
+authors = ["Jack O'Connor <oconnor663@gmail.com>", "John Servil"]
+description = "b3sum, the BLAKE3 command-line hasher, on blake3-servil: the same digests, faster"
+repository = "https://github.com/johnservil/BLAKE3"
 license = "CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception"
 readme = "README.md"
 edition = "2024"
 
+[[bin]]
+name = "b3sum"
+path = "src/main.rs"
+
 [features]
-neon = ["blake3/neon"]
-prefer_intrinsics = ["blake3/prefer_intrinsics"]
-pure = ["blake3/pure"]
 
 [dependencies]
 anyhow = "1.0.25"
-blake3 = { version = "1.8.7", path = "..", features = ["mmap", "rayon"] }
+blake3 = { version = "=0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861", path = "..", package = "blake3-servil" }
 clap = { version = "4.0.8", features = ["derive", "wrap_help"] }
 hex = "0.4.0"
-rayon-core = "1.12.1"
-wild = "2.0.3"
+
+# A file already in the page cache is mapped and hashed in place.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+memmap2 = "0.9"
 
 [dev-dependencies]
 duct = "1.0.0"

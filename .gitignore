@@ -1,2 +1,5 @@
 Cargo.lock
 target
+__pycache__/
+/dist
+/tools/verify/bob/.lake

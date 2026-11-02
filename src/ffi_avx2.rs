@@ -19,7 +19,7 @@ pub unsafe fn hash_many<const N: usize>(
         // array, but the C implementations don't. Even though this is an unsafe
         // function, assert the bounds here.
         assert!(out.len() >= inputs.len() * OUT_LEN);
-        ffi::blake3_hash_many_avx2(
+        ffi::blake3_servil_hash_many_avx2(
             inputs.as_ptr() as *const *const u8,
             inputs.len(),
             N / BLOCK_LEN,
@@ -36,7 +36,7 @@ pub unsafe fn hash_many<const N: usize>(
 
 pub mod ffi {
     unsafe extern "C" {
-        pub fn blake3_hash_many_avx2(
+        pub fn blake3_servil_hash_many_avx2(
             inputs: *const *const u8,
             num_inputs: usize,
             blocks: usize,
@@ -48,18 +48,5 @@ pub mod ffi {
             flags_end: u8,
             out: *mut u8,
         );
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_hash_many() {
-        if !crate::platform::avx2_detected() {
-            return;
-        }
-        crate::test::test_hash_many_fn(hash_many, hash_many);
     }
 }

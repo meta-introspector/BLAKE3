@@ -179,9 +179,8 @@ next section, this gives us an important set of properties:
 7. Finally, if a filepath contains a Unicode replacement character (U+FFFD) or
    a null character (U+0000), it is an error.
 
-   **Additionally, on Windows only:**
-
-8. In output, all backslashes (U+005C) are replaced with forward slashes
-   (U+002F).
-9. When checking, after unescaping, if a filepath contains a backslash, it is
-   an error.
+This `b3sum` runs on Unix alone (Linux and macOS; Windows is not
+supported: BLAKE3 #160). Official BLAKE3's `b3sum` on Windows adds two rules
+of its own: in output it writes every backslash as a forward slash, and when
+checking it refuses a filepath with a backslash. So a checkfile it makes
+names its files with forward slashes, and checks here as any other.

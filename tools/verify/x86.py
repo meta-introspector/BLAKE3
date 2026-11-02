@@ -1,0 +1,930 @@
+import functools
+_FACT_CACHE = {}
+
+"""A model of the x86-64 instructions BLAKE3's kernels use, for proving
+the assembled machine code (upstream's c/blake3_{sse41,avx2,avx512}_
+x86-64_unix.S and the fork's generated kernels) as aarch64.py proves the
+Arm kernels.
+
+The machine runs LLVM's disassembly (Intel syntax) of a linked object, so
+rip-relative constants resolve to the image. General registers hold 64-bit
+terms or pointers (aarch64.Ptr); vector registers 16 32-bit lane terms
+(xmm the first 4, ymm 8, zmm 16); mask registers 16-bit terms; the flags
+the operands of the last instruction that set them, read by condition.
+Memory, pointers, and branch decisions are aarch64's: only lengths may
+steer a branch or an address.
+
+Counter words: the kernels compute a lane's counter halves with compares
+and blends where the standard adds 64-bit counters. `facts` holds the
+standard's terms for them; a small lane term the solver proves equal to
+one is replaced by it, so the rounds' terms meet the specification's in
+one normal form (canon.py). The replacement is the proved equality.
+"""
+
+import os
+import re
+import subprocess
+
+from z3 import (BitVec, BitVecVal, Concat, Extract, LShR, RotateLeft, RotateRight, ZeroExt, If, ULT, UGT, ULE,
+                UGE, Not, Solver, simplify, substitute, is_bv_value, unsat, Z3_OP_EXTRACT)
+
+import aarch64
+import canon
+import random
+import terms
+from aarch64 import Ptr, Region, Unproved, decide, as_bv, concrete
+
+def tool(name):
+    """LLVM's `name`, the newest version installed (17 or later)."""
+    import shutil
+    for v in ("", "-19", "-18", "-17"):
+        for path in (f"/usr/lib/llvm{v}/bin/{name}", shutil.which(f"{name}{v}") or ""):
+            if path and os.path.exists(path):
+                return path
+    raise AssertionError(f"no {name}: install LLVM 17 or later")
+
+
+LLVM_OBJDUMP = tool("llvm-objdump")
+LLD = tool("ld.lld")
+
+GPR = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"] + [f"r{i}" for i in range(8, 16)]
+SUB = {}
+for base, e, x, l in (("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"), ("rcx", "ecx", "cx", "cl"),
+                      ("rdx", "edx", "dx", "dl"), ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+                      ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl")):
+    SUB.update({base: (base, 64), e: (base, 32), x: (base, 16), l: (base, 8)})
+for i in range(8, 16):
+    SUB.update({f"r{i}": (f"r{i}", 64), f"r{i}d": (f"r{i}", 32), f"r{i}w": (f"r{i}", 16), f"r{i}b": (f"r{i}", 8)})
+SIZES = {"byte": 1, "word": 2, "dword": 4, "qword": 8, "xmmword": 16, "ymmword": 32, "zmmword": 64}
+
+
+def link(obj):
+    """A shared object of `obj`, so its rip-relative constants resolve."""
+    so = obj + ".so"
+    subprocess.run([LLD, "-shared", obj, "-o", so], check=True)
+    return so
+
+
+@functools.lru_cache(None)
+def disassemble(so, start, stop):
+    """{address: (mnemonic, [operands], next address)} for [start, stop)."""
+    out = subprocess.run([LLVM_OBJDUMP, "-d", "--no-show-raw-insn", "-M", "intel", f"--start-address={start}",
+                          f"--stop-address={stop}", so], capture_output=True, text=True, check=True).stdout
+    rows = []
+    for line in out.splitlines():
+        m = re.match(r"\s*([0-9a-f]+):\s*\t(\S+)(?:\t(.*))?$", line)
+        if not m:
+            continue
+        addr, mnem, rest = int(m.group(1), 16), m.group(2), (m.group(3) or "")
+        target = None
+        if "#" in rest:
+            rest, comment = rest.split("#", 1)
+            t = re.match(r"\s*0x([0-9a-f]+)", comment)
+            target = int(t.group(1), 16) if t else None
+        rows.append((addr, mnem, split(rest.strip()), target))
+    code = {}
+    for i, (addr, mnem, ops, target) in enumerate(rows):
+        nxt = rows[i + 1][0] if i + 1 < len(rows) else stop
+
+        def absolute(mt):
+            # A rip-relative operand: the next instruction's address plus
+            # the displacement, as the CPU computes it.
+            disp = int(mt.group(2), 16) if mt.group(2) else 0
+            return f"[abs {nxt + (-disp if mt.group(1) == '-' else disp):#x}]"
+        ops = [re.sub(r"\[rip(?: ([+-]) (0x[0-9a-f]+))?\]", absolute, o) for o in ops]
+        code[addr] = (mnem, ops, nxt)
+    return code
+
+
+def split(ops):
+    """Operands at top-level commas."""
+    out, depth, cur = [], 0, ""
+    for ch in ops:
+        if ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+@functools.lru_cache(None)
+def sections(so):
+    """{name: (address, size)} of the image's sections."""
+    out = subprocess.run([LLVM_OBJDUMP, "-h", so], capture_output=True, text=True, check=True).stdout
+    secs = {}
+    for line in out.splitlines():
+        p = line.split()
+        if len(p) >= 4 and p[0].isdigit():
+            secs[p[1]] = (int(p[3], 16), int(p[2], 16))
+    return secs
+
+
+@functools.lru_cache(None)
+def symbols(so):
+    """{name: address}: the ELF image's symbol values."""
+    out = subprocess.run([LLVM_OBJDUMP, "-t", so], capture_output=True, text=True, check=True).stdout
+    syms = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.match(r"^[0-9a-f]{16}$", parts[0]):
+            syms[parts[-1]] = int(parts[0], 16)
+    return syms
+
+
+@functools.lru_cache(None)
+def text_end(so):
+    addr, size = sections(so)[".text"]
+    return addr + size
+
+
+@functools.lru_cache(None)
+def image(so):
+    """The image's loaded bytes, {address: int}: code and constants."""
+    names = [n for n in sections(so) if n in (".text", ".rodata", ".data")]
+    out = subprocess.run([LLVM_OBJDUMP, "-s"] + [f"--section={n}" for n in names] + [so],
+                         capture_output=True, text=True, check=True).stdout
+    data = {}
+    for line in out.splitlines():
+        mt = re.match(r"^ ([0-9a-f]+) ((?:[0-9a-f]{2,8} ){1,4})", line + " ")
+        if not mt:
+            continue
+        addr = int(mt.group(1), 16)
+        hexs = "".join(mt.group(2).split())
+        for i in range(0, len(hexs), 2):
+            data[addr + i // 2] = int(hexs[i:i + 2], 16)
+    return data
+
+
+class Machine(aarch64.Machine):
+    def __init__(self, code, regions):
+        super().__init__(code, regions)
+        self.k = {i: BitVecVal(0, 16) for i in range(8)}
+        self.flags = None
+        self.facts = ()          # the standard's small terms (counter words): see the module's doc
+        self.fact_symbols = set()
+        self.normals_for = None  # the facts that normal's memo and sample points were made for
+
+    # Memory: aarch64's, the stack bounded below by rsp (less the red
+    # zone, 128 bytes under SysV).
+    red_zone = 0
+
+    def access(self, addr, n, write):
+        rsp = self.x["rsp"]
+        self.x["sp"] = Ptr("stack", rsp.offset - self.red_zone) if isinstance(rsp, Ptr) else rsp
+        try:
+            return super().access(addr, n, write)
+        finally:
+            del self.x["sp"]
+
+    def step_at(self, pc):
+        """One instruction at `pc` (induction.py's hook): the next pc, or
+        "ret" when the return address is the caller's."""
+        aarch64._machine[0] = self
+        mnem, ops, nxt = self.code[pc]
+        aarch64.EXECUTED.add((mnem, tuple(ops)))
+        try:
+            out = step(self, pc, mnem, ops, nxt)
+        except Unproved as e:
+            raise Unproved(f"{e} (at {pc:#x}: {mnem} {', '.join(ops)})") from None
+        if out == "ret":
+            to = self.load(self.x["rsp"], 8)
+            self.x["rsp"] = self.x["rsp"] + 8
+            if isinstance(to, Ptr) and to.region == "return":
+                return "ret"
+            if isinstance(to, Ptr) and to.region == "code":
+                return to.offset
+            raise Unproved(f"return to {to}")
+        return out
+
+    # General registers.
+    def gread(self, name):
+        base, bits = SUB[name]
+        v = self.x[base]
+        if bits == 64:
+            return v
+        if isinstance(v, Ptr):
+            raise Unproved(f"a {bits}-bit read of a pointer in {name}")
+        return tidy(Extract(bits - 1, 0, v))
+
+    def gwrite(self, name, v):
+        base, bits = SUB[name]
+        if bits == 64:
+            self.x[base] = v
+            return
+        if isinstance(v, Ptr):
+            raise Unproved(f"a pointer written to {name}")
+        v = tidy(v)
+        if bits == 32:
+            self.x[base] = ZeroExt(32, v)
+        else:
+            old = self.x[base]
+            if isinstance(old, Ptr):
+                raise Unproved(f"a partial write of a pointer in {name}")
+            self.x[base] = tidy(Concat(Extract(63, bits, old), v))
+
+    # Vector registers.
+    def lanes(self, name):
+        return self.v[int(re.match(r"[xyz]mm(\d+)", name).group(1))]
+
+    def vwrite(self, name, new, vex):
+        """Write `new` (its width's lanes) to a vector register: VEX and
+        EVEX forms zero the lanes above; legacy SSE keeps them."""
+        n = int(re.match(r"[xyz]mm(\d+)", name).group(1))
+        # Any write forgets a pointer parked there (park, below).
+        self.__dict__.setdefault("parked", {}).pop(n, None)
+        new = [self.normal(x) for x in new]
+        if vex:
+            self.v[n] = new + [BitVecVal(0, 32)] * (16 - len(new))
+        else:
+            self.v[n] = new + self.v[n][len(new):]
+
+    def normal(self, t):
+        """The standard's form of a small term proved equal to one of
+        `facts` (the module's doc), else `t`: the first fact, in order,
+        that the solver proves equal. Each term is decided once for each
+        `facts` (a tuple, so adding facts makes a new one and starts the
+        memo afresh); terms.py keeps the term, so its id stays its own."""
+        if not self.facts:
+            return t
+        if self.normals_for is not self.facts:
+            fkey = tuple(terms.ast_id(f) for f in self.facts)
+            entry = _FACT_CACHE.get(fkey)
+            if entry is None:
+                for f in self.facts:
+                    terms.keep(f)
+                entry = [{terms.ast_id(f): f for f in self.facts}, None, None]
+                _FACT_CACHE[fkey] = entry
+            self.normals, self._fact_entry, self.normals_for = entry[0], entry, self.facts
+        k = terms.ast_id(t)
+        r = self.normals.get(k)
+        if r is None:
+            terms.keep(t)
+            r = self.normals[k] = t if is_bv_value(t) else self._normal(t)
+        return r
+
+    def _normal(self, t):
+        if not terms.symbols(t) <= self.fact_symbols or not terms.small(t):
+            return t
+        # Only facts that agree with t at the sample points can equal it
+        # (equal terms agree at every point), so the solver tries those
+        # alone; a t whose value there is not a constant (a symbol no fact
+        # has) goes to the solver against every fact.
+        entry = self._fact_entry
+        if entry[1] is None:
+            syms = {}
+            for f in self.facts:
+                canon.symbols_of(f, syms, set())
+            rng = random.Random(0)
+            points = [[(v, BitVecVal(rng.getrandbits(v.size()), v.size())) for v in syms.values()]
+                      for _ in range(2)]
+            # Adjacent counter high halves almost always agree randomly.
+            # Probe each declared offset's carry boundary with the other
+            # parameters zero, so false candidates reach the solver rarely.
+            zero = [(v, BitVecVal(0, v.size())) for v in syms.values()]
+            boundaries = {(f.size(), simplify(substitute(f.arg(0), *zero)).as_long())
+                          for f in self.facts if f.decl().kind() == Z3_OP_EXTRACT and f.arg(0).size() == 64}
+            for bits, offset in sorted(boundaries):
+                for v in syms.values():
+                    if v.size() == 64:
+                        points.append([(u, BitVecVal((1 << bits) - offset if u.eq(v) else 0, u.size()))
+                                       for u in syms.values()])
+            entry[1] = points
+            entry[2] = [[simplify(substitute(f, *p)) for p in points] for f in self.facts]
+            assert all(is_bv_value(v) for fv in entry[2] for v in fv), "a fact's symbol without a point"
+        points, fact_values = entry[1], entry[2]
+        values = [simplify(substitute(t, *p)) for p in points]
+        sampled = all(is_bv_value(v) for v in values)
+        for f, fv in zip(self.facts, fact_values):
+            if sampled and not all(x.eq(y) for x, y in zip(values, fv)):
+                continue
+            s = Solver()
+            s.add(t != f)
+            if s.check() == unsat:
+                return f
+        return t
+
+
+def width(name):
+    return {"x": 4, "y": 8, "z": 16}[name[0]]
+
+
+def is_vreg(op):
+    return re.match(r"^[xyz]mm\d+$", op) is not None
+
+
+def imm(op):
+    return int(op, 0)
+
+
+def strip_mask(op):
+    """An operand and its EVEX mask: ('zmm0', 1, zeroing)."""
+    m = re.match(r"^(\S+)\s*\{k(\d)\}(\s*\{z\})?$", op)
+    if m:
+        return m.group(1), int(m.group(2)), bool(m.group(3))
+    return op, None, False
+
+
+def address(m, op):
+    """A memory operand's size (bytes, or None) and address."""
+    mt = re.match(r"^(?:(\w+) ptr )?\[(.*)\](\{1to\d+\})?$", op)
+    if not mt:
+        raise Unproved(f"unparsed memory operand {op}")
+    size = SIZES.get(mt.group(1)) if mt.group(1) else None
+    inside = mt.group(2).strip()
+    if inside.startswith("abs "):
+        return size, Ptr("image", int(inside[4:], 16)), mt.group(3)
+    base, disp = None, 0
+    for sign, term in re.findall(r"([+-]?)\s*([^+-]+)", inside):
+        term = term.strip()
+        neg = sign == "-"
+        if re.match(r"^(0x[0-9a-f]+|\d+)$", term):
+            disp += -int(term, 0) if neg else int(term, 0)
+        elif "*" in term:
+            sc, r = term.split("*")
+            if sc.strip() in SUB:
+                sc, r = r, sc
+            val = m.gread(r.strip())
+            if isinstance(val, Ptr):
+                raise Unproved("a scaled pointer")
+            idx = as_bv(val) * int(sc.strip(), 0)
+            base = idx if base is None else (base + idx if not isinstance(base, Ptr) else base + idx)
+        else:
+            val = m.gread(term)
+            if base is None:
+                base = val
+            elif isinstance(val, Ptr):
+                base = val + base
+            else:
+                base = base + val
+    if base is None:
+        raise Unproved(f"an absolute address {op}")
+    if not isinstance(base, Ptr):
+        raise Unproved(f"an address that is no pointer: {op}")
+    addr = base + disp
+    if not isinstance(addr.offset, int) and not aarch64.lengths_only(m, as_bv(addr.offset)):
+        raise Unproved(f"data-dependent memory address: {op}")
+    return size, addr, mt.group(3)
+
+
+def load_lanes(m, op, w):
+    size, addr, bcast = address(m, op)
+    if bcast:
+        word = m.load(addr, 4)
+        return [word] * w
+    n = 4 * w if size is None else size
+    # Each lane as its four bytes, in lean_spec.join's form.
+    return m.load_words(addr, n // 4)
+
+
+def src_lanes(m, op, w):
+    if is_vreg(op):
+        return m.lanes(op)[:w]
+    return load_lanes(m, op, w)
+
+
+def gval(m, op, bits):
+    """A general operand's value: register, immediate, or memory."""
+    if op in SUB:
+        return m.gread(op)
+    if op.startswith("[") or " ptr [" in op:
+        size, addr, _ = address(m, op)
+        return m.load(addr, size or bits // 8)
+    return BitVecVal(imm(op) % (1 << bits), bits)
+
+
+def opbits(m, op):
+    if op in SUB:
+        return SUB[op][1]
+    mt = re.match(r"^(\w+) ptr", op)
+    return 8 * SIZES[mt.group(1)] if mt else 64
+
+
+def ptr_add(a, b, sub=False):
+    """a + b (or a - b) where a or b may be a pointer."""
+    if isinstance(a, Ptr) and isinstance(b, Ptr):
+        if not sub or a.region != b.region:
+            raise Unproved("arithmetic on two pointers")
+        return simplify(as_bv(a.offset) - as_bv(b.offset))
+    def num(v):
+        c = concrete(v)
+        return (c if c < 1 << 63 else c - (1 << 64)) if c is not None else v
+    if isinstance(b, Ptr):
+        if sub:
+            raise Unproved("a pointer subtracted from a number")
+        return b + num(a)
+    if isinstance(a, Ptr):
+        nb = num(b)
+        return a + ((-nb if isinstance(nb, int) else simplify(-as_bv(nb))) if sub else nb)
+    return tidy(a - b if sub else a + b)
+
+
+def cond(m, cc):
+    """The condition `cc` on the flags the last setter left."""
+    f = m.flags
+    if f is None:
+        raise Unproved("a condition on unset flags")
+    kind = f[0]
+    if kind == "sub":
+        _, a, b = f
+        table = {"e": a == b, "z": a == b, "ne": a != b, "nz": a != b, "b": ULT(a, b), "c": ULT(a, b),
+                 "ae": UGE(a, b), "nc": UGE(a, b), "a": UGT(a, b), "be": ULE(a, b),
+                 "l": a < b, "ge": a >= b, "g": a > b, "le": a <= b}
+    elif kind == "logic":
+        _, r = f
+        z = r == 0
+        table = {"e": z, "z": z, "ne": Not(z), "nz": Not(z), "s": r < 0, "ns": r >= 0, "b": False, "ae": True,
+                 "a": Not(z), "be": z}
+    elif kind == "dec":
+        _, r = f
+        table = {"e": r == 0, "z": r == 0, "ne": r != 0, "nz": r != 0}
+    else:
+        raise Unproved(f"flags of {kind}")
+    if cc not in table:
+        raise Unproved(f"condition {cc} after {kind}")
+    return table[cc]
+
+
+def flag_operands(a, b):
+    """Two compared values as terms: pointers into one region by offset."""
+    if isinstance(a, Ptr) or isinstance(b, Ptr):
+        if not (isinstance(a, Ptr) and isinstance(b, Ptr) and a.region == b.region):
+            raise Unproved("a comparison of a pointer with a number")
+        return as_bv(a.offset), as_bv(b.offset)
+    return a, b
+
+
+def tidy(t):
+    """`t` simplified, unless it holds round arithmetic: Z3's simplify
+    rewrites a rotation into shifts and concatenations, and sums into
+    products, forms canon does not read; canon normalizes those itself.
+    (A kernel computing its rounds in general registers met this first:
+    BLAKE3 #150.)"""
+    return t if canon.has_arith(t) else simplify(t)
+
+
+def lanes128(x):
+    """A lane list as 128-bit lanes of four."""
+    return [x[i:i + 4] for i in range(0, len(x), 4)]
+
+
+def bytes_of(lane):
+    return [Extract(8 * i + 7, 8 * i, lane) for i in range(4)]
+
+
+def pshufb(src, mask):
+    out = []
+    for blk, mblk in zip(lanes128(src), lanes128(mask)):
+        mb = []
+        for word in mblk:
+            c = concrete(word)
+            if c is None:
+                raise Unproved("pshufb with a mask that is not constant")
+            mb += [(c >> (8 * i)) & 0xff for i in range(4)]
+        sb = [b for w in blk for b in bytes_of(w)]
+        for j in range(4):
+            sel = mb[4 * j:4 * j + 4]
+            rot = next((k for k in (1, 2, 3) if sel == [4 * j + (i + k) % 4 for i in range(4)]), None)
+            if rot is not None:
+                out.append(RotateRight(blk[j], 8 * rot))
+                continue
+            parts = [BitVecVal(0, 8) if s & 0x80 else sb[s & 15] for s in sel]
+            out.append(Concat(*reversed(parts)))
+    return out
+
+
+def blend_words(a, b, imm8):
+    """pblendw: 16-bit word i from b where imm8 bit i % 8."""
+    out = []
+    for j, (x, y) in enumerate(zip(a, b)):
+        lo, hi = (imm8 >> ((2 * j) % 8)) & 1, (imm8 >> ((2 * j + 1) % 8)) & 1
+        if lo == hi:
+            out.append(y if lo else x)
+        else:
+            out.append(Concat(Extract(31, 16, y if hi else x), Extract(15, 0, y if lo else x)))
+    return out
+
+
+def shift_part(t):
+    """(x, k) when t is x << k (k > 0), (x, -k) when x >> k; else None."""
+    from z3 import is_app_of, Z3_OP_BSHL, Z3_OP_BLSHR
+    for op, sign in ((Z3_OP_BSHL, 1), (Z3_OP_BLSHR, -1)):
+        if is_app_of(t, op) and is_bv_value(t.arg(1)):
+            return t.arg(0), sign * t.arg(1).as_long()
+    return None
+
+
+def orr(x, y):
+    """x | y; the rotation itself when they are x << (32 - k) and x >> k
+    of one x (the kernels' rotate by 12 and 7), as canon.py knows it."""
+    px, py = shift_part(x), shift_part(y)
+    if px and py and px[0].eq(py[0]) and px[1] * py[1] < 0 and abs(px[1]) + abs(py[1]) == 32:
+        right = -px[1] if px[1] < 0 else -py[1]
+        return RotateRight(px[0], right)
+    return x | y
+
+
+def kbit(m, k, j):
+    return Extract(j, j, m.k[k]) == 1
+
+
+def step(m, pc, mnem, ops, nxt):
+    """Execute one instruction; the next pc, or 'ret'."""
+    vex = mnem.startswith("v")
+    base = mnem[1:] if vex and mnem not in ("vzeroupper",) else mnem
+    # Branches.
+    if mnem == "jmp":
+        return int(ops[0].split()[0], 16)
+    if mnem.startswith("j"):
+        return int(ops[0].split()[0], 16) if decide(m, cond(m, mnem[1:])) else nxt
+    if mnem == "ret":
+        return "ret"
+    if mnem == "prefetcht0":
+        # Prefetch may address bytes beyond a buffer, but its address must
+        # still be independent of secrets. It supplies no loaded value.
+        address(m, ops[0])
+        return nxt
+    if mnem in ("nop", "endbr64"):
+        return nxt
+    if mnem == "vzeroupper":
+        for i in range(16):
+            m.v[i] = m.v[i][:4] + [BitVecVal(0, 32)] * 12
+        return nxt
+    # General-register instructions.
+    if mnem == "push":
+        m.x["rsp"] = m.x["rsp"] + (-8)
+        m.store(m.x["rsp"], m.gread(ops[0]), 8)
+        return nxt
+    if mnem == "pop":
+        m.gwrite(ops[0], m.load(m.x["rsp"], 8))
+        m.x["rsp"] = m.x["rsp"] + 8
+        return nxt
+    if mnem in ("mov", "movabs", "movzx") and not any(is_vreg(o) for o in ops):
+        if ops[0].startswith("[") or " ptr [" in ops[0]:
+            size, addr, _ = address(m, ops[0])
+            val = gval(m, ops[1], 8 * size)
+            m.store(addr, val, size)
+        else:
+            bits = SUB[ops[0]][1]
+            val = gval(m, ops[1], bits if mnem in ("mov", "movabs") else opbits(m, ops[1]))
+            if mnem == "movzx":
+                val = ZeroExt(bits - val.size(), val)
+            m.gwrite(ops[0], val)
+        return nxt
+    if mnem == "lea":
+        _, addr, _ = address(m, ops[1])
+        m.gwrite(ops[0], addr)
+        return nxt
+    if mnem in ("xor", "sub") and ops[0] == ops[1] and ops[0] in SUB:
+        # The zeroing idiom: zero whatever the register held, a pointer too.
+        bits = SUB[ops[0]][1]
+        if bits == 64 or bits == 32:
+            m.x[SUB[ops[0]][0]] = BitVecVal(0, 64)
+        else:
+            m.gwrite(ops[0], BitVecVal(0, bits))
+        m.flags = ("logic", BitVecVal(0, bits))
+        return nxt
+    if mnem in ("add", "sub", "and", "or", "xor", "cmp", "test"):
+        bits = opbits(m, ops[0])
+        if mnem == "xor" and ops[0] == ops[1]:
+            # The idiom that zeroes a register, whatever it held (a pointer too).
+            m.gwrite(ops[0], BitVecVal(0, bits))
+            m.flags = ("logic", BitVecVal(0, bits))
+            return nxt
+        a = gval(m, ops[0], bits)
+        b = gval(m, ops[1], bits)
+        if mnem in ("add", "sub", "cmp"):
+            r = ptr_add(a, b, sub=mnem != "add")
+            if mnem == "cmp" or (mnem == "sub" and not (isinstance(a, Ptr) or isinstance(b, Ptr))):
+                m.flags = ("sub",) + flag_operands(a, b)
+            elif mnem == "sub":
+                m.flags = None  # pointer arithmetic: no condition follows it here
+            else:
+                m.flags = ("logic", r) if not isinstance(r, Ptr) else None
+            if mnem != "cmp":
+                m.gwrite(ops[0], r)
+            return nxt
+        if mnem == "and" and isinstance(a, Ptr) and a.region == "stack" and concrete(b) is not None:
+            # Aligning the stack pointer: the stack region starts 64-byte
+            # aligned (Setup), so its offsets align as its addresses do.
+            mask = concrete(b)
+            assert (1 << 64) - mask <= 64, "an alignment of at most 64 bytes"
+            aligned = simplify(as_bv(a.offset) & mask)
+            residue = getattr(m, "entry_residue", None)
+            if residue is not None:
+                # At the common entry alignment, the bounded residue makes
+                # the aligned pointer a single concrete stack offset.
+                candidate = simplify(substitute(aligned, (residue, BitVecVal(8, 64))))
+                if aarch64.holds(m, aligned == candidate):
+                    aligned = candidate
+                else:
+                    # Name the aligned frame base. Later frame offsets are
+                    # then ordinary sums of a length symbol, whose byte keys
+                    # canonicalize; the equality keeps its bounds/alignment.
+                    frame = BitVec(f"len_stack_frame{getattr(m, 'frame_count', 0)}", 64)
+                    m.frame_count = getattr(m, "frame_count", 0) + 1
+                    m.assumptions.append(frame == aligned)
+                    m.lengths.add(frame.decl().name())
+                    aligned = frame
+            m.gwrite(ops[0], Ptr("stack", aligned))
+            m.flags = None
+            return nxt
+        if isinstance(a, Ptr) or isinstance(b, Ptr):
+            raise Unproved(f"{mnem} on a pointer")
+        r = tidy({"and": a & b, "or": a | b, "xor": a ^ b, "test": a & b}[mnem])
+        m.flags = ("logic", r)
+        if mnem != "test":
+            m.gwrite(ops[0], r)
+        return nxt
+    if mnem in ("shl", "shr", "ror", "rol", "neg", "dec", "inc"):
+        bits = opbits(m, ops[0])
+        a = gval(m, ops[0], bits)
+        if isinstance(a, Ptr):
+            raise Unproved(f"{mnem} on a pointer")
+        if mnem == "shl":
+            r = a << imm(ops[1])
+        elif mnem == "shr":
+            r = LShR(a, imm(ops[1]))
+        elif mnem == "ror":
+            r = RotateRight(a, imm(ops[1]) % bits)
+        elif mnem == "rol":
+            r = RotateLeft(a, imm(ops[1]) % bits)
+        elif mnem == "neg":
+            r = -a
+        else:
+            r = a - 1 if mnem == "dec" else a + 1
+        r = tidy(r)
+        m.flags = ("dec", r) if mnem in ("dec", "inc") else None
+        m.gwrite(ops[0], r)
+        return nxt
+    if mnem.startswith("cmov"):
+        if decide(m, cond(m, mnem[4:])):
+            m.gwrite(ops[0], gval(m, ops[1], SUB[ops[0]][1]))
+        return nxt
+    # Mask registers.
+    if mnem == "kmovw":
+        if ops[0].startswith("k"):
+            m.k[int(ops[0][1])] = Extract(15, 0, gval(m, ops[1], 32))
+        else:
+            m.gwrite(ops[0], ZeroExt(16, m.k[int(ops[1][1])]))
+        return nxt
+    if mnem == "knotw":
+        m.k[int(ops[0][1])] = simplify(~m.k[int(ops[1][1])])
+        return nxt
+    # Vector instructions.
+    return vector(m, mnem, base, vex, ops, nxt)
+
+
+VECTOR_MOVES = ("movups", "movaps", "movdqu", "movdqa", "movdqu32", "movdqa32")
+
+
+def memory_alignment(base, vex, size):
+    """Required alignment for the vector memory forms this model supports."""
+    if base in ("movaps", "movdqa", "movdqa32") or (
+            not vex and size == 16 and base not in ("movups", "movdqu")):
+        assert size is not None, "an aligned vector memory operand has a width"
+        return size
+    return 1
+
+
+def vector(m, mnem, base, vex, ops, nxt):
+    dst, mask, zeroing = strip_mask(ops[0])
+    for operand in ops:
+        if "[" not in operand:
+            continue
+        size, addr, _ = address(m, operand)
+        if mask is not None and not aarch64.lengths_only(m, m.k[mask]):
+            raise Unproved(f"data-dependent memory mask in {mnem}")
+        # Legacy SSE's full-width memory operands require alignment,
+        # except its explicitly unaligned moves. VEX/EVEX arithmetic
+        # permits unaligned memory; the aligned moves retain their rule.
+        alignment = memory_alignment(base, vex, size)
+        if alignment > 1:
+            region = m.regions[addr.region]
+            if region.alignment < alignment or not aarch64.holds(m, as_bv(addr.offset) & (alignment - 1) == 0):
+                raise Unproved(f"{mnem} needs {alignment}-byte alignment at {addr}")
+    # Stores.
+    if not is_vreg(dst) and not dst.startswith("k") and dst not in SUB:
+        if base not in VECTOR_MOVES + ("movd", "movq", "extracti128", "extracti32x4"):
+            raise Unproved(f"unmodelled vector store: {mnem}")
+        size, addr, _ = address(m, dst)
+        src = ops[-1]
+        if base in ("extracti128", "extracti32x4"):
+            sel = imm(ops[2]) & (1 if base == "extracti128" else 3)
+            val = m.lanes(ops[1])[4 * sel:4 * sel + 4]
+        elif base in ("movd",):
+            val = m.lanes(src)[:1]
+        elif base in ("movq",):
+            val = m.lanes(src)[:2]
+        else:
+            val = m.lanes(src)[:size // 4]
+        if mask is not None:
+            raise Unproved("a masked store")
+        m.store(addr, Concat(*reversed(val)) if len(val) > 1 else val[0], 4 * len(val))
+        return nxt
+    if dst in SUB:
+        # movd / movq to a general register: a pointer parked by movq
+        # comes back as itself (park, below).
+        parked = m.__dict__.get("parked", {}).get(int(re.match(r"[xyz]mm(\d+)", ops[1]).group(1)))
+        if base == "movq" and parked is not None:
+            m.gwrite(dst, parked)
+            return nxt
+        src = m.lanes(ops[1])
+        if base == "movd":
+            m.gwrite(dst, src[0])
+        elif base == "movq":
+            m.gwrite(dst, Concat(src[1], src[0]))
+        else:
+            raise Unproved(f"{mnem} to a general register")
+        return nxt
+    if dst.startswith("k"):
+        k = int(dst[1])
+        if base == "pcmpltud":
+            a, b = m.lanes(ops[1])[:width(ops[1])], src_lanes(m, ops[2], width(ops[1]))
+            bits = [If(ULT(x, y), BitVecVal(1, 1), BitVecVal(0, 1)) for x, y in zip(a, b)]
+            m.k[k] = simplify(ZeroExt(16 - len(bits), Concat(*reversed(bits))))
+            return nxt
+        raise Unproved(f"{mnem} to a mask register")
+    w = width(dst)
+    old = m.lanes(dst)[:w]
+    srcs = ops[1:]
+    two = not vex  # legacy SSE: dst is also the first source
+    if two:
+        a_op, rest = dst, srcs
+    else:
+        a_op, rest = (srcs[0] if srcs else dst), srcs[1:]
+
+    def A():
+        return src_lanes(m, a_op, w)
+
+    def B(i=0):
+        return src_lanes(m, rest[i], w)
+
+    if base in VECTOR_MOVES:
+        new = src_lanes(m, ops[1], w)
+    elif base in ("movd", "movq"):
+        s = ops[1]
+        if s in SUB:
+            val = gval(m, s, SUB[s][1])
+            if isinstance(val, Ptr):
+                # Park: a kernel short of general registers keeps a pointer
+                # in a vector register (movq xmm, r64) and takes it back
+                # (movq r64, xmm). The lanes become unknowns, so no vector
+                # operation on a pointer proves anything; any other write
+                # to the register forgets it.
+                if base != "movq":
+                    raise Unproved(f"{mnem} of a pointer")
+                count = m.__dict__.setdefault("park_count", [0])
+                count[0] += 1
+                m.vwrite(dst, [BitVec(f"parked{count[0]}_{i}", 32) for i in range(2)] + [BitVecVal(0, 32)] * 2, vex)
+                m.parked[int(re.match(r"[xyz]mm(\d+)", dst).group(1))] = val
+                return nxt
+            parts = [val] if base == "movd" else [Extract(31, 0, val), Extract(63, 32, val)]
+        else:
+            parts = load_lanes(m, s, 1 if base == "movd" else 2)
+        new = (parts + [BitVecVal(0, 32)] * 4)[:4]
+        w = 4
+        # Legacy movd/movq zero the rest of the xmm register and keep the
+        # lanes above it; the VEX forms zero those too.
+        m.vwrite(dst, new, vex)
+        return nxt
+    elif base in ("paddd", "psubd", "pxor", "pxord", "por", "pand"):
+        a, b = A(), B()
+        op = {"paddd": lambda x, y: x + y, "psubd": lambda x, y: x - y, "pxor": lambda x, y: x ^ y,
+              "pxord": lambda x, y: x ^ y, "por": orr, "pand": lambda x, y: x & y}[base]
+        new = [op(x, y) for x, y in zip(a, b)]
+    elif base in ("pslld", "psrld", "prord"):
+        a, k = A(), imm(rest[-1])
+        if base == "pslld":
+            new = [x << k if k < 32 else BitVecVal(0, 32) for x in a]
+        elif base == "psrld":
+            new = [LShR(x, k) if k < 32 else BitVecVal(0, 32) for x in a]
+        else:
+            new = [RotateRight(x, k % 32) for x in a]
+    elif base == "pshufb":
+        new = pshufb(A(), B())
+    elif base == "pshufd":
+        s, k = src_lanes(m, srcs[0], w), imm(srcs[-1])
+        new = [blk[(k >> (2 * j)) & 3] for blk in lanes128(s) for j in range(4)]
+    elif base == "shufps":
+        a, b, k = A(), B(), imm(rest[-1])
+        new = []
+        for x, y in zip(lanes128(a), lanes128(b)):
+            new += [x[k & 3], x[(k >> 2) & 3], y[(k >> 4) & 3], y[(k >> 6) & 3]]
+    elif base in ("punpckldq", "unpcklps", "punpckhdq", "unpckhps", "punpcklqdq", "unpcklpd", "punpckhqdq", "unpckhpd"):
+        a, b = A(), B()
+        new = []
+        for x, y in zip(lanes128(a), lanes128(b)):
+            new += {"punpckldq": [x[0], y[0], x[1], y[1]], "unpcklps": [x[0], y[0], x[1], y[1]],
+                    "punpckhdq": [x[2], y[2], x[3], y[3]], "unpckhps": [x[2], y[2], x[3], y[3]],
+                    "punpcklqdq": [x[0], x[1], y[0], y[1]], "unpcklpd": [x[0], x[1], y[0], y[1]],
+                    "punpckhqdq": [x[2], x[3], y[2], y[3]], "unpckhpd": [x[2], x[3], y[2], y[3]]}[base]
+    elif base == "pblendw":
+        new = blend_words(A(), B(), imm(rest[-1]))
+    elif base in ("pblendd", "blendps"):
+        a, b, k = A(), B(), imm(rest[-1])
+        new = [y if (k >> (j % 8)) & 1 else x for j, (x, y) in enumerate(zip(a, b))]
+    elif base in ("blendvps",):
+        if two:
+            a, b, sel = A(), B(), m.lanes("xmm0")[:4]
+        else:
+            a, b, sel = A(), B(), src_lanes(m, rest[1], w)
+        new = [If(Extract(31, 31, s) == 1, y, x) for x, y, s in zip(a, b, sel)]
+    elif base == "pcmpgtd":
+        a, b = A(), B()
+        new = [If(x > y, BitVecVal(0xFFFFFFFF, 32), BitVecVal(0, 32)) for x, y in zip(a, b)]
+    elif base == "pblendmd":
+        a, b = A(), B()
+        new = [If(kbit(m, mask, j), y, x) for j, (x, y) in enumerate(zip(a, b))]
+        mask = None
+    elif base in ("pinsrd", "pinsrq"):
+        new, s = list(A()), rest[0]
+        if base == "pinsrd":
+            new[imm(rest[-1]) & 3] = gval(m, s, 32) if (s in SUB or "ptr" in s) else None
+        else:
+            val, at = gval(m, s, 64), 2 * (imm(rest[-1]) & 1)
+            new[at:at + 2] = [Extract(31, 0, val), Extract(63, 32, val)]
+    elif base in ("broadcasti128", "broadcasti32x4"):
+        blk = load_lanes(m, srcs[0], 4)
+        new = (blk * 4)[:w]
+    elif base == "pbroadcastd":
+        s = srcs[0]
+        word = m.lanes(s)[0] if is_vreg(s) else m.gread(s) if s in SUB else load_lanes(m, s, 1)[0]
+        new = [word] * w
+    elif base in ("inserti128", "insertf128", "inserti32x4", "inserti64x4"):
+        a, k = A(), imm(rest[-1])
+        part = src_lanes(m, rest[0], 8 if base == "inserti64x4" else 4)
+        n = len(part)
+        at = (k & (1 if n == 8 or base in ("inserti128", "insertf128") else 3)) * n
+        new = list(a)
+        new[at:at + n] = part
+    elif base in ("perm2i128", "perm2f128"):
+        a, b, k = A(), B(), imm(rest[-1])
+        table = lanes128(a) + lanes128(b)
+        new = []
+        for half in (k & 0xF, k >> 4):
+            new += [BitVecVal(0, 32)] * 4 if half & 8 else table[half & 3]
+    elif base == "permq":
+        s, k = src_lanes(m, srcs[0], w), imm(srcs[-1])
+        q = [s[i:i + 2] for i in range(0, len(s), 2)]
+        new = []
+        for blk in range(0, len(q), 4):
+            for j in range(4):
+                new += q[blk + ((k >> (2 * j)) & 3)]
+    elif base == "shufi32x4":
+        a, b, k = A(), B(), imm(rest[-1])
+        la, lb = lanes128(a), lanes128(b)
+        if w == 16:
+            new = la[k & 3] + la[(k >> 2) & 3] + lb[(k >> 4) & 3] + lb[(k >> 6) & 3]
+        else:
+            new = la[k & 1] + lb[(k >> 1) & 1]
+    elif base in ("permt2d", "permi2d"):
+        idx = old if base == "permi2d" else A()
+        tables = (A(), B()) if base == "permi2d" else (old, B())
+        bits = 4 if w == 16 else 3
+        new = []
+        for j in range(w):
+            c = concrete(idx[j])
+            if c is None:
+                raise Unproved(f"{mnem} with indices that are not constant")
+            new.append(tables[(c >> bits) & 1][c & (w - 1)])
+    else:
+        raise Unproved(f"no model of {mnem} {', '.join(ops)}")
+    if mask is not None:
+        new = [If(kbit(m, mask, j), y, BitVecVal(0, 32) if zeroing else x) for j, (x, y) in enumerate(zip(old, new))]
+    m.vwrite(dst, new, vex)
+    return nxt
+
+
+EXECUTED = set()
+
+
+def run(m, entry, max_steps=2_000_000):
+    """Execute from `entry` to the return through the entry's return
+    address."""
+    pc = entry
+    while True:
+        m.steps += 1
+        if m.steps > max_steps:
+            raise Unproved("too many steps")
+        if pc not in m.code:
+            raise Unproved(f"execution reached {pc:#x}, outside the code under proof")
+        mnem, ops, nxt = m.code[pc]
+        EXECUTED.add((mnem, tuple(ops)))
+        here = pc
+        try:
+            pc = step(m, pc, mnem, ops, nxt)
+        except Unproved as e:
+            raise Unproved(f"{e} (at {here:#x}: {mnem} {', '.join(ops)})") from None
+        if pc == "ret":
+            to = m.load(m.x["rsp"], 8)
+            m.x["rsp"] = m.x["rsp"] + 8
+            if isinstance(to, Ptr) and to.region == "return":
+                return m
+            raise Unproved(f"return to {to}")

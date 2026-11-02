@@ -1,28 +1,9 @@
 use std::env;
+use std::path::PathBuf;
 
 fn defined(var: &str) -> bool {
     println!("cargo::rerun-if-env-changed={}", var);
     env::var_os(var).is_some()
-}
-
-fn is_pure() -> bool {
-    defined("CARGO_FEATURE_PURE")
-}
-
-fn should_prefer_intrinsics() -> bool {
-    defined("CARGO_FEATURE_PREFER_INTRINSICS")
-}
-
-fn is_neon() -> bool {
-    defined("CARGO_FEATURE_NEON")
-}
-
-fn is_no_neon() -> bool {
-    defined("CARGO_FEATURE_NO_NEON")
-}
-
-fn is_wasm32_simd() -> bool {
-    defined("CARGO_FEATURE_WASM32_SIMD")
 }
 
 fn is_ci() -> bool {
@@ -47,101 +28,13 @@ fn is_x86_64() -> bool {
     target_components()[0] == "x86_64"
 }
 
-fn is_windows_target() -> bool {
-    env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows"
-}
-
-fn use_msvc_asm() -> bool {
-    const MSVC_NAMES: &[&str] = &["", "cl", "cl.exe"];
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let target_windows_msvc = target_os == "windows" && target_env == "msvc";
-    let host_triple = env::var("HOST").unwrap_or_default();
-    let target_triple = env::var("TARGET").unwrap_or_default();
-    let cross_compiling = host_triple != target_triple;
-    let cc = env::var("CC").unwrap_or_default().to_ascii_lowercase();
-    if !target_windows_msvc {
-        // We are not building for Windows with the MSVC toolchain.
-        false
-    } else if !cross_compiling && MSVC_NAMES.contains(&&*cc) {
-        // We are building on Windows with the MSVC toolchain (and not cross-compiling for another architecture or target).
-        true
-    } else {
-        // We are cross-compiling to Windows with the MSVC toolchain.
-        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-        let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
-        let cc = env::var(format!("CC_{target_arch}_{target_vendor}_windows_msvc"))
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        // Check if we are using the MSVC compiler.
-        MSVC_NAMES.contains(&&*cc)
-    }
-}
-
-fn is_x86_32() -> bool {
-    let arch = &target_components()[0];
-    arch == "i386" || arch == "i586" || arch == "i686"
-}
-
-fn is_arm() -> bool {
-    is_armv7() || is_aarch64() || target_components()[0] == "arm"
-}
-
 fn is_aarch64() -> bool {
     target_components()[0] == "aarch64"
 }
 
-fn is_armv7() -> bool {
-    target_components()[0] == "armv7"
-}
-
-fn is_wasm32() -> bool {
-    target_components()[0] == "wasm32"
-}
-
-fn endianness() -> String {
-    let endianness = env::var("CARGO_CFG_TARGET_ENDIAN").unwrap();
-    assert!(endianness == "little" || endianness == "big");
-    endianness
-}
-
-fn is_little_endian() -> bool {
-    endianness() == "little"
-}
-
-fn is_big_endian() -> bool {
-    endianness() == "big"
-}
-
-// Windows targets may be using the MSVC toolchain or the MinGW toolchain. The
-// right compiler flags to use depend on the toolchain. (And we don't want to
-// use flag_if_supported, because we don't want features to be silently
-// disabled by old compilers.)
-fn is_windows_msvc() -> bool {
-    // Some targets are only two components long, so check in steps.
-    let second_component = &target_components()[1];
-    (second_component == "pc" || second_component == "win7")
-        && target_components()[2] == "windows"
-        && target_components()[3] == "msvc"
-}
-
-// MinGW toolchain uses 2 different targets depending on the main compiler.
-// Target for a general MinGW toolchain ends with `-gnu` (GCC is used as C
-// compiler). Target for a LLVM-MinGW toolchain (Clang is used as C compiler)
-// ends with `-gnullvm`.
-fn is_windows_gnu() -> bool {
-    // Some targets are only two components long, so check in steps.
-    let second_component = &target_components()[1];
-    (second_component == "pc" || second_component == "win7")
-        && target_components()[2] == "windows"
-        && target_components()[3] != "msvc"
-}
-
 fn new_build() -> cc::Build {
     let mut build = cc::Build::new();
-    if !is_windows_msvc() {
-        build.flag("-std=c11");
-    }
+    build.flag("-std=c11");
     // Do NOT trigger a rebuild any time the env changes (e.g. $PATH).
     // This prevents all downstream crates from being rebuilt when `cargo check`
     // or `cargo build` are run in different environments, like Rust Analyzer
@@ -150,228 +43,190 @@ fn new_build() -> cc::Build {
     build
 }
 
-#[derive(PartialEq)]
-enum CCompilerSupport {
-    NoCompiler,
-    NoAVX512,
-    YesAVX512,
-}
-use CCompilerSupport::*;
-
-fn c_compiler_support() -> CCompilerSupport {
+/// The x86-64 kernels' assembler: a C compiler that takes the AVX-512
+/// flags, as GCC 12 and Clang do. Without one the build stops, as on
+/// AArch64, pointing to official BLAKE3: this crate runs its assembly or
+/// nothing.
+fn assert_assembles_x86() {
     let build = new_build();
-    let flags_checked;
-    let support_result: Result<bool, _> = if is_windows_msvc() {
-        flags_checked = "/arch:AVX512";
-        build.is_flag_supported("/arch:AVX512")
-    } else {
-        // Check for both of the flags we use. If -mavx512f works, then -mavx512vl
-        // will probably always work too, but we might as well be thorough.
-        flags_checked = "-mavx512f and -mavx512vl";
-        match build.is_flag_supported("-mavx512f") {
-            Ok(true) => build.is_flag_supported("-mavx512vl"),
-            false_or_error => false_or_error,
-        }
-    };
-    match support_result {
-        Ok(true) => YesAVX512,
-        Ok(false) => {
-            warn(&format!(
-                "The C compiler {:?} does not support {}.",
-                build.get_compiler().path(),
-                flags_checked,
-            ));
-            NoAVX512
-        }
-        Err(e) => {
-            println!("{:?}", e);
-            warn(&format!(
-                "No C compiler {:?} detected.",
-                build.get_compiler().path()
-            ));
-            NoCompiler
-        }
-    }
+    let compiler = build.get_compiler().path().to_owned();
+    // Both flags we use. If -mavx512f works, then -mavx512vl will probably
+    // always work too, but we might as well be thorough.
+    let takes = |flag| build.is_flag_supported(flag).unwrap_or(false);
+    assert!(
+        takes("-mavx512f") && takes("-mavx512vl"),
+        "blake3-servil: {compiler:?} is not a C compiler that assembles the x86-64 kernels \
+         (GCC 12 or later, or Clang); use official BLAKE3 for a build without assembly (https://github.com/BLAKE3-team/BLAKE3)"
+    );
 }
 
-fn build_sse2_sse41_avx2_rust_intrinsics() {
-    // No C code to compile here. Set the cfg flags that enable the Rust SSE2,
-    // SSE4.1, and AVX2 intrinsics modules. The regular Cargo build will compile
-    // them.
-    println!("cargo::rustc-cfg=blake3_sse2_rust");
-    println!("cargo::rustc-cfg=blake3_sse41_rust");
-    println!("cargo::rustc-cfg=blake3_avx2_rust");
-}
-
-fn build_sse2_sse41_avx2_assembly() {
-    // Build the assembly implementations for SSE4.1 and AVX2. This is
-    // preferred, but it only supports x86_64.
+fn build_sse41_avx2_assembly() {
+    // Build the assembly implementations for SSE4.1 and AVX2.
     assert!(is_x86_64());
-    println!("cargo::rustc-cfg=blake3_sse2_ffi");
     println!("cargo::rustc-cfg=blake3_sse41_ffi");
     println!("cargo::rustc-cfg=blake3_avx2_ffi");
     let mut build = new_build();
-    if is_windows_target() {
-        if use_msvc_asm() {
-            build.file("c/blake3_sse2_x86-64_windows_msvc.asm");
-            build.file("c/blake3_sse41_x86-64_windows_msvc.asm");
-            build.file("c/blake3_avx2_x86-64_windows_msvc.asm");
-        } else {
-            build.file("c/blake3_sse2_x86-64_windows_gnu.S");
-            build.file("c/blake3_sse41_x86-64_windows_gnu.S");
-            build.file("c/blake3_avx2_x86-64_windows_gnu.S");
-        }
-    } else {
-        // All non-Windows implementations are assumed to support
-        // Linux-style assembly. These files do contain a small
-        // explicit workaround for macOS also.
-        build.file("c/blake3_sse2_x86-64_unix.S");
-        build.file("c/blake3_sse41_x86-64_unix.S");
-        build.file("c/blake3_avx2_x86-64_unix.S");
-    }
-    build.compile("blake3_sse2_sse41_avx2_assembly");
-}
-
-fn build_avx512_c_intrinsics() {
-    // This is required on 32-bit x86 targets, since the assembly
-    // implementation doesn't support those.
-    println!("cargo::rustc-cfg=blake3_avx512_ffi");
-    let mut build = new_build();
-    build.file("c/blake3_avx512.c");
-    if is_windows_msvc() {
-        build.flag("/arch:AVX512");
-    } else {
-        build.flag("-mavx512f");
-        build.flag("-mavx512vl");
-    }
-    if is_windows_gnu() {
-        // Workaround for https://gcc.gnu.org/bugzilla/show_bug.cgi?id=65782.
-        build.flag("-fno-asynchronous-unwind-tables");
-    }
-    build.compile("blake3_avx512_intrinsics");
+    // The Unix assembly (Linux and macOS: the files carry macOS's one
+    // difference themselves).
+    build.file("c/blake3_sse41_x86-64_unix.S");
+    build.file("c/blake3_avx2_x86-64_unix.S");
+    // The fork's own kernels (the pass with a partial chunk, the chunk root
+    // in one call).
+    build.file("c/blake3_partial_x86-64_unix.S");
+    build.file("c/blake3_chunk_root_x86-64_unix.S");
+    build.compile("blake3_sse41_avx2_assembly");
 }
 
 fn build_avx512_assembly() {
-    // Build the assembly implementation for AVX-512. This is preferred, but it
-    // only supports x86_64.
+    // Build the assembly implementation for AVX-512.
     assert!(is_x86_64());
     println!("cargo::rustc-cfg=blake3_avx512_ffi");
     let mut build = new_build();
-    let mut is_msvc = false;
-    if is_windows_target() {
-        if use_msvc_asm() {
-            build.file("c/blake3_avx512_x86-64_windows_msvc.asm");
-            is_msvc = true;
-        } else {
-            build.file("c/blake3_avx512_x86-64_windows_gnu.S");
-        }
-    } else {
-        build.file("c/blake3_avx512_x86-64_unix.S");
+    build.file("c/blake3_avx512_x86-64_unix.S");
+    // The wide kernels (32 inputs a pass; tools/gen_avx512_32.py): ELF
+    // directives, so Linux, the one x86-64 target.
+    if env::var("CARGO_CFG_TARGET_OS").unwrap() == "linux" {
+        build.file("c/blake3_avx512_32.S");
     }
-
     // Older versions of Clang require these flags, even for assembly. See
     // https://github.com/BLAKE3-team/BLAKE3/issues/79.
-    if !is_msvc {
-        build.flag("-mavx512f");
-        build.flag("-mavx512vl");
-    }
+    build.flag("-mavx512f");
+    build.flag("-mavx512vl");
     build.compile("blake3_avx512_assembly");
 }
 
-fn build_neon_c_intrinsics() {
+// Whether this build assembles `source` with `flag`, as it will assemble the
+// kernel files: with the caller's CFLAGS, and with the `.arch` directive that
+// opens each kernel file, which reaches the assembler whatever -march the
+// flags end with. A test of the flag alone passes under CFLAGS=-march=native,
+// whose -march overrides the flag, while an assembler that predates the
+// extension still rejects the kernel file's `.arch` line.
+fn assembles(name: &str, flag: &str, source: &str) -> bool {
+    let path = PathBuf::from(env::var("OUT_DIR").unwrap()).join(format!("probe_{name}.S"));
+    std::fs::write(&path, source).unwrap();
     let mut build = new_build();
-    // Note that blake3_neon.c normally depends on the blake3_portable.c
-    // for the single-instance compression function, but we expose
-    // portable.rs over FFI instead. See ffi_neon.rs.
-    build.file("c/blake3_neon.c");
-    // ARMv7 platforms that support NEON generally need the following
-    // flags. AArch64 supports NEON by default and does not support -mpfu.
-    if is_armv7() {
-        build.flag("-mfpu=neon-vfpv4");
-        build.flag("-mfloat-abi=hard");
-    }
-    build.compile("blake3_neon");
+    build.file(&path).flag(flag).cargo_metadata(false).cargo_warnings(false);
+    build.try_compile(&format!("probe_{name}")).is_ok()
 }
 
-fn build_wasm32_simd() {
-    assert!(is_wasm32());
-    // No C code to compile here. Set the cfg flags that enable the Wasm SIMD.
-    // The regular Cargo build will compile it.
-    println!("cargo::rustc-cfg=blake3_wasm32_simd");
+// The SME2 assembly implementation needs an assembler that understands
+// `.arch armv9-a+sme2` (Clang/LLVM 17+, Xcode 15+, or binutils 2.41+ with
+// GCC 14+). With an older compiler the crate builds without the SME2 kernel,
+// with a warning: only CPUs with SME2 (Apple M4 and later) run it, and the
+// NEON and scalar kernels serve every AArch64 CPU. Common Linux systems
+// (Debian 12, Raspberry Pi OS) ship such compilers.
+fn c_compiler_supports_sme2() -> bool {
+    let compiler = new_build().get_compiler().path().to_owned();
+    let supported = assembles("sme2", "-march=armv9-a+sme2", ".arch armv9-a+sme2\nsmstart sm\nsmstop sm\n");
+    if !supported {
+        warn(&format!(
+            "blake3-servil: {compiler:?} cannot assemble SME2 (-march=armv9-a+sme2), so this \
+             build leaves out the SME2 kernel, which Apple M4 and later CPUs run. Clang/LLVM 17 \
+             or later (for example CC=clang-19), Xcode 15 or later, or GCC 14 or later builds it."
+        ));
+    }
+    supported
+}
+
+fn build_sme2_assembly() {
+    // The SME2 implementation is assembly only. It requires runtime
+    // detection (see platform.rs), and it requires a 512-bit streaming vector
+    // length, which the kernel checks for itself.
+    assert!(is_aarch64());
+    println!("cargo::rustc-cfg=blake3_sme2");
+    let mut build = new_build();
+    build.file("c/blake3_sme2_aarch64.S");
+    // Generated by tools/gen_sme2_hybrid.py: SME2 groups with an integer lane.
+    build.file("c/blake3_sme2_hybrid_aarch64.S");
+    build.flag("-march=armv9-a+sme2");
+    build.compile("blake3_sme2_assembly");
+}
+
+// The integer + NEON kernels need an assembler that knows armv8.2-a+sha3
+// (GNU as 2.30+, LLVM 7+). With an older one the build stops and says so.
+fn assert_assembles_sha3() {
+    let compiler = new_build().get_compiler().path().to_owned();
+    assert!(
+        assembles("sha3", "-march=armv8.2-a+sha3", ".arch armv8.2-a+sha3\nxar v0.2d, v1.2d, v2.2d, #1\n"),
+        "blake3-servil: {compiler:?} cannot assemble armv8.2-a+sha3, which the AArch64 kernels need \
+         (GNU as 2.30 or later, or Clang/LLVM 7 or later); use official BLAKE3 for a build without assembly (https://github.com/BLAKE3-team/BLAKE3)"
+    );
+}
+
+fn build_neon_hybrid_assembly() {
+    // Integer + NEON kernels for one to fifteen chunks (and parents). The
+    // pair kernels use `xar` from the SHA-3 extension, detected at runtime;
+    // the scalar and quad kernels run everywhere. Assembling needs an
+    // assembler that knows armv8.2-a+sha3 (GNU as 2.30+, LLVM 7+).
+    assert!(is_aarch64());
+    let mut build = new_build();
+    build.file("c/blake3_neon_hybrid_aarch64.S");
+    build.compile("blake3_neon_hybrid_assembly");
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The supported targets, and every other one stopped here, before
+    // anything is built: a build elsewhere would run code no machine of
+    // ours tests, where official BLAKE3 supports it (#160, #180).
+    let var = |name: &str| env::var(name).unwrap_or_default();
+    let (arch, os) = (var("CARGO_CFG_TARGET_ARCH"), var("CARGO_CFG_TARGET_OS"));
+    let supported = var("CARGO_CFG_TARGET_ENDIAN") == "little"
+        && match arch.as_str() {
+            "x86_64" => os == "linux",
+            "aarch64" => os == "linux" || os == "macos",
+            _ => false,
+        };
+    assert!(
+        supported,
+        "blake3-servil runs on x86-64 Linux and on 64-bit Arm Linux and macOS; for {}, use official BLAKE3 (https://github.com/BLAKE3-team/BLAKE3)",
+        var("TARGET")
+    );
     // If CFLAGS is set, make sure LTO is disabled by appending -fno-lto. (We can't do this with
     // .flag() later on, because CFLAGS takes precedence.) Any mismatch between the C compiler and
     // the Rust linker can cause linker errors in our C intrinsics implementations if LTO is
     // enabled. See https://github.com/BLAKE3-team/BLAKE3/issues/550.
-    if !is_windows_msvc() {
-        if let Some(mut flags) = env::var_os("CFLAGS") {
-            flags.push(" -fno-lto");
-            // SAFETY: This build script is single-threaded.
-            unsafe {
-                env::set_var("CFLAGS", flags);
-            }
+    if let Some(mut flags) = env::var_os("CFLAGS") {
+        flags.push(" -fno-lto");
+        // SAFETY: This build script is single-threaded.
+        unsafe {
+            env::set_var("CFLAGS", flags);
         }
     }
 
     // As of Rust 1.80, unrecognized config names are warnings. Give Cargo all of our config names.
-    let all_cfgs = [
-        "blake3_sse2_ffi",
-        "blake3_sse2_rust",
-        "blake3_sse41_ffi",
-        "blake3_sse41_rust",
-        "blake3_avx2_ffi",
-        "blake3_avx2_rust",
-        "blake3_avx512_ffi",
-        "blake3_neon",
-        "blake3_wasm32_simd",
-    ];
+    // `shuttle` gates tests/shuttle_*.rs (RUSTFLAGS="--cfg shuttle"); the
+    // library compiles the same either way.
+    let all_cfgs = ["blake3_sse41_ffi", "blake3_avx2_ffi", "blake3_avx512_ffi", "blake3_neon", "blake3_sme2", "shuttle"];
     for cfg_name in all_cfgs {
         // https://doc.rust-lang.org/cargo/reference/build-scripts.html#outputs-of-the-build-script
         println!("cargo::rustc-check-cfg=cfg({cfg_name}, values(none()))");
     }
 
-    if is_pure() && is_neon() {
-        panic!("It doesn't make sense to enable both \"pure\" and \"neon\".");
+    if is_x86_64() {
+        assert_assembles_x86();
+        build_sse41_avx2_assembly();
+        build_avx512_assembly();
     }
 
-    if is_no_neon() && is_neon() {
-        panic!("It doesn't make sense to enable both \"no_neon\" and \"neon\".");
-    }
-
-    if is_x86_64() || is_x86_32() {
-        let support = c_compiler_support();
-        if is_x86_32() || should_prefer_intrinsics() || is_pure() || support == NoCompiler {
-            build_sse2_sse41_avx2_rust_intrinsics();
-        } else {
-            // We assume that all C compilers can assemble SSE4.1 and AVX2. We
-            // don't explicitly check for support.
-            build_sse2_sse41_avx2_assembly();
-        }
-
-        if is_pure() || support == NoCompiler || support == NoAVX512 {
-            // The binary will not include any AVX-512 code.
-        } else if is_x86_32() || should_prefer_intrinsics() {
-            build_avx512_c_intrinsics();
-        } else {
-            build_avx512_assembly();
-        }
-    }
-
-    if is_neon() && is_big_endian() {
-        panic!("The NEON implementation doesn't support big-endian ARM.")
-    }
-
-    if (is_arm() && is_neon())
-        || (!is_no_neon() && !is_pure() && is_aarch64() && is_little_endian())
-    {
+    if is_aarch64() {
         println!("cargo::rustc-cfg=blake3_neon");
-        build_neon_c_intrinsics();
-    }
+        assert_assembles_sha3();
+        build_neon_hybrid_assembly();
 
-    if is_wasm32() && is_wasm32_simd() {
-        build_wasm32_simd();
+        // SME2 sits on top of NEON: the SME2 wrapper falls back to NEON for
+        // inputs that don't fill a group of sixteen. It is built on every
+        // AArch64 target with NEON enabled and runtime detection (Apple
+        // platforms and Linux, the same cfg as platform.rs's sme2_reported
+        // and Cargo.toml's libc dependency) whose C compiler assembles SME2.
+        // Platform::detect() selects the SME2 kernels when the CPU reports
+        // SME2 with 512-bit streaming vectors and the NEON hybrids otherwise.
+        let target_vendor = env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default();
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        if target_vendor == "apple" || target_os == "linux" {
+            if c_compiler_supports_sme2() {
+                build_sme2_assembly();
+            }
+        }
     }
 
     // The `cc` crate doesn't automatically emit rerun-if directives for the
@@ -383,19 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Ditto for source files, though these shouldn't change as often.
     for file in std::fs::read_dir("c")? {
-        println!(
-            "cargo::rerun-if-changed={}",
-            file?.path().to_str().expect("utf-8")
-        );
-    }
-
-    // When compiling with clang-cl for windows, it adds .asm files to the root
-    // which we need to delete so cargo doesn't get angry
-    if is_windows_target() && !use_msvc_asm() {
-        let _ = std::fs::remove_file("blake3_avx2_x86-64_windows_gnu.asm");
-        let _ = std::fs::remove_file("blake3_avx512_x86-64_windows_gnu.asm");
-        let _ = std::fs::remove_file("blake3_sse2_x86-64_windows_gnu.asm");
-        let _ = std::fs::remove_file("blake3_sse41_x86-64_windows_gnu.asm");
+        println!("cargo::rerun-if-changed={}", file?.path().to_str().expect("utf-8"));
     }
 
     Ok(())

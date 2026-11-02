@@ -1,3 +1,35 @@
+//! b3sum: BLAKE3's command-line hasher. It hashes its inputs on
+//! `available_parallelism` threads, an atomic index handing each the next,
+//! printing lines in order; a cached file of 512 KiB or more is mapped and
+//! hashed in place over the pool and held mapped (`hold`); any other input
+//! is read into two buffers, the next read overlapping the hashing
+//! (`update_from`); on Linux, small files that miss the page cache are read
+//! ahead by the kernel, many at once (`readahead`).
+//!
+//! The costs it is designed around (i7-12700K, Linux 7.0, cached files, a
+//! P core): open 0.65 us, fstat 0.19 us, reading 16 KiB 1.1 us, close
+//! 0.19 us; a thread's start 15-30 us; a hand-off to an awake thread about
+//! 30 ns, a sleeping one's wake 15-45 us before it runs; a whole b3sum
+//! process 650-800 us. A file handed to the pool pays a wake to save less
+//! than it costs below a few MiB.
+//!
+//! Tried and set aside (`bench-hashes b3sum`, against the design above;
+//! the evidence in Devon's bench-hashes-validation, b3sum-*):
+//! - One stream for every file (`Stream::submit_reader` among them):
+//!   slower for whole files, cached x1.18-2.2, 1000 x 16 KiB up to x5.3
+//!   from storage: opening and reading a file costs the kernel about 8 us
+//!   and hashing 16 KiB 1.6 us, so a few threads cannot open fast enough,
+//!   and with many, handing a file over costs more than hashing it.
+//! - io_uring: as fast as the readahead hints with a ring per thread; one
+//!   ring for the run 2.8x slower cached (io-wq does every statx).
+//! - O_DIRECT for files that miss (x1.27-1.85), madvise WILLNEED or
+//!   MADV_POPULATE_READ on mappings (level to 42% slower), huge pages
+//!   (level), parallel pread of aligned subtrees without mapping (slower,
+//!   more CPU), buffered output (within noise).
+//! - Planning ahead (stat every file, big files first): x1.03-1.20 slower;
+//!   fixed files a thread, or each thread starting the next: 17-47% slower
+//!   on large runs.
+
 use anyhow::{bail, ensure};
 use clap::Parser;
 use std::cmp;
@@ -11,6 +43,9 @@ mod unit_tests;
 
 const NAME: &str = "b3sum";
 
+#[cfg(target_os = "linux")]
+mod readahead;
+
 const DERIVE_KEY_ARG: &str = "derive_key";
 const KEYED_ARG: &str = "keyed";
 const LENGTH_ARG: &str = "length";
@@ -20,11 +55,9 @@ const TAG_ARG: &str = "tag";
 const CHECK_ARG: &str = "check";
 
 #[derive(Parser)]
-#[command(version, max_term_width(100))]
+#[command(version, max_term_width(100), after_help = "More information: b3sum/README.md at https://github.com/johnservil/BLAKE3/blob/servil/b3sum/README.md")]
 struct Inner {
     /// Files to hash, or checkfiles to check
-    ///
-    /// When no file is given, or when - is given, read standard input.
     file: Vec<PathBuf>,
 
     /// Use the keyed mode, reading the 32-byte key from stdin
@@ -32,8 +65,6 @@ struct Inner {
     keyed: bool,
 
     /// Use the key derivation mode, with the given context string
-    ///
-    /// Cannot be used with --keyed.
     #[arg(long, value_name("CONTEXT"), conflicts_with(KEYED_ARG))]
     derive_key: Option<String>,
 
@@ -50,16 +81,11 @@ struct Inner {
     #[arg(long, default_value_t = 0, value_name("SEEK"))]
     seek: u64,
 
-    /// The maximum number of threads to use
-    ///
-    /// By default, this is the number of logical cores. If this flag is
-    /// omitted, or if its value is 0, RAYON_NUM_THREADS is also respected.
+    /// The most threads hashing at once [default: as fast as b3sum can]
     #[arg(long, value_name("NUM"))]
-    num_threads: Option<usize>,
+    num_threads: Option<std::num::NonZeroUsize>,
 
-    /// Disable memory mapping
-    ///
-    /// Currently this also disables multithreading.
+    /// No effect: b3sum chooses between reading and mapping each file
     #[arg(long)]
     no_mmap: bool,
 
@@ -68,8 +94,6 @@ struct Inner {
     no_names: bool,
 
     /// Write raw output bytes to stdout, rather than hex
-    ///
-    /// --no-names is implied. In this case, only a single input is allowed.
     #[arg(long)]
     raw: bool,
 
@@ -91,8 +115,6 @@ struct Inner {
     check: bool,
 
     /// Skip printing OK for each checked file
-    ///
-    /// Must be used with --check.
     #[arg(long, requires(CHECK_ARG))]
     quiet: bool,
 }
@@ -100,39 +122,29 @@ struct Inner {
 struct Args {
     inner: Inner,
     file_args: Vec<PathBuf>,
-    base_hasher: blake3::Hasher,
+    base_hasher: blake3::performance::Hasher,
 }
 
 impl Args {
     fn parse() -> anyhow::Result<Self> {
-        // wild::args_os() is equivalent to std::env::args_os() on Unix,
-        // but on Windows it adds support for globbing.
-        let inner = Inner::parse_from(wild::args_os());
-        let file_args = if !inner.file.is_empty() {
-            inner.file.clone()
-        } else {
-            vec!["-".into()]
-        };
+        let inner = Inner::parse_from(std::env::args_os());
+        let file_args = if !inner.file.is_empty() { inner.file.clone() } else { vec!["-".into()] };
         if inner.raw && file_args.len() > 1 {
             bail!("Only one filename can be provided when using --raw");
         }
         let base_hasher = if inner.keyed {
             // In keyed mode, since stdin is used for the key, we can't handle
             // `-` arguments. Input::open handles that case below.
-            blake3::Hasher::new_keyed(&read_key_from_stdin()?)
+            blake3::performance::Hasher::new(blake3::Mode::Keyed(&read_key_from_stdin()?))
         } else if let Some(ref context) = inner.derive_key {
-            blake3::Hasher::new_derive_key(context)
+            blake3::performance::Hasher::new(blake3::Mode::DeriveKey(context))
         } else {
-            blake3::Hasher::new()
+            blake3::performance::Hasher::new(blake3::Mode::Plain)
         };
-        Ok(Self {
-            inner,
-            file_args,
-            base_hasher,
-        })
+        Ok(Self { inner, file_args, base_hasher })
     }
 
-    fn num_threads(&self) -> Option<usize> {
+    fn num_threads(&self) -> Option<std::num::NonZeroUsize> {
         self.inner.num_threads
     }
 
@@ -146,10 +158,6 @@ impl Args {
 
     fn tag(&self) -> bool {
         self.inner.tag
-    }
-
-    fn no_mmap(&self) -> bool {
-        self.inner.no_mmap
     }
 
     fn no_names(&self) -> bool {
@@ -179,16 +187,223 @@ fn hash_path(args: &Args, path: &Path) -> anyhow::Result<blake3::OutputReader> {
         if args.keyed() {
             bail!("Cannot open `-` in keyed mode");
         }
-        hasher.update_reader(io::stdin().lock())?;
-    } else if args.no_mmap() {
-        hasher.update_reader(File::open(path)?)?;
+        update_from(&mut hasher, io::stdin())?;
     } else {
-        // The fast path: Try to mmap the file and hash it with multiple threads.
-        hasher.update_mmap_rayon(path)?;
+        let file = File::open(path)?;
+        #[cfg(unix)]
+        if let Some(map) = mapped(&file) {
+            update(&mut hasher, &map);
+            hold(map);
+        } else {
+            update_from(&mut hasher, file)?;
+        }
+        #[cfg(not(unix))]
+        update_from(&mut hasher, file)?;
     }
     let mut output_reader = hasher.finalize_xof();
     output_reader.set_position(args.seek());
     Ok(output_reader)
+}
+
+/// The most pages b3sum leaves mapped to the process's exit, each kept by
+/// one page-table entry (8 bytes, kernel memory, until exit): 262144 pages,
+/// about 2 MiB of entries, which map 1 GiB of files with 4 KiB pages (4 GiB
+/// with Apple's 16 KiB). The file's own pages are page cache, as after any
+/// read, and stay reclaimable while mapped.
+#[cfg(unix)]
+const HOLD_PAGES: u64 = 1 << 18;
+
+/// A hashed file's mapping, left to the process's exit while the pages
+/// held stay within HOLD_PAGES, else unmapped now. Unmapping tears down
+/// the file's page-table entries, about 65 ns a page with cross-core TLB
+/// flushes (i7-12700K: 23-25 ms of a 56 ms run for a cached 1 GiB file),
+/// while entries that merely exist cost
+/// nothing measured beside their memory: a process holding 6 GiB of
+/// touched mappings slowed another's reads of 10 GiB not at all (2.32
+/// GiB/s either way), at 2 MiB of page tables a GiB, its files kept cached
+/// in preference; exit reclaims them (crash-only). The cap bounds what a
+/// run over many large files holds (John, #56: holding every file of a
+/// 10 TB run would hold 20 GB of page tables). Measured against unmapping
+/// every file (servil), at a 1 GiB cap: 16 files of 64 MiB x0.82-0.93, the
+/// mixed tree x0.87-0.90; holding only the last file lost the gain (x1.00).
+#[cfg(unix)]
+fn hold(map: memmap2::Mmap) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static HELD: AtomicU64 = AtomicU64::new(0);
+    // Sound: a plain query.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("the page size is positive");
+    let pages = (map.len() as u64).div_ceil(page);
+    if HELD.fetch_add(pages, Ordering::Relaxed) + pages <= HOLD_PAGES {
+        std::mem::forget(map);
+    } else {
+        HELD.fetch_sub(pages, Ordering::Relaxed);
+    }
+}
+
+/// `file` mapped, when it is at least MAP_LEN long and, outside Linux, in the page cache
+/// (its first page, by mincore): hashed in place over the pool, it skips
+/// the copy a read makes, which a reader thread does alone (Linux VM,
+/// 1 GiB in the page cache: 32 ms mapped against 79 ms read; Apple M4 Max
+/// 37 against 50). On macOS a file not in the cache is read: a mapping's
+/// page faults fetch it a few pages at a time (Mac, 1 GiB from storage:
+/// 402 ms mapped against 159 ms read). Linux reads ahead for a mapping, so
+/// it maps every file from MAP_LEN (i7-12700K, ext4 on NVMe, 1 GiB from
+/// storage: about 325 ms mapped against 410-527 ms read). A file cached
+/// only in part may be judged either way; either way hashes it right.
+#[cfg(unix)]
+fn mapped(file: &File) -> Option<memmap2::Mmap> {
+    let len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+    if len < MAP_LEN {
+        return None;
+    }
+    // Sound: the mapping is read while this process holds the file open;
+    // a file another program truncates meanwhile is the caller's risk, as
+    // with any mapping (upstream b3sum mapped every file).
+    let map = unsafe { memmap2::Mmap::map(file) }.ok()?;
+    if cfg!(target_os = "linux") {
+        return Some(map);
+    }
+    resident(&map).then_some(map)
+}
+
+/// Whether `map`'s first page is in the page cache (mincore): a file read
+/// moments before, or one not yet read from storage.
+#[cfg(unix)]
+fn resident(map: &memmap2::Mmap) -> bool {
+    let mut resident = 0u8;
+    // Sound: the mapping's first page, from its start.
+    let rc = unsafe { libc::mincore(map.as_ptr() as *mut libc::c_void, 1, (&mut resident as *mut u8).cast()) };
+    rc == 0 && resident & 1 == 1
+}
+
+/// The shortest file mapped when it is in the page cache: where the pool
+/// takes over (the library's 512 KiB). A shorter file is hashed on one
+/// thread, and a mapping's page faults interrupt it once a page, each
+/// putting the SME unit in its slow state (macOS: 1 GiB on one thread 2.6x
+/// slower mapped than prefaulted, probe/willneed-mechanism, job 1156); a
+/// read's copy into a cached buffer faults nothing.
+#[cfg(unix)]
+const MAP_LEN: usize = POOL_LEN;
+
+/// Where the pool takes over: the library's 512 KiB, below which a
+/// multithreaded call hashes on the calling thread.
+const POOL_LEN: usize = 512 << 10;
+
+/// The most threads b3sum hashes on: --num-threads (main sets it), else
+/// one per CPU (threads asks, the first time it is needed).
+static THREADS: std::sync::OnceLock<std::num::NonZeroUsize> = std::sync::OnceLock::new();
+
+/// One per CPU unless --num-threads named a number: asked for only when
+/// it matters (several files, or a file the pool takes), since on Linux
+/// available_parallelism reads the process's cgroup files, eight system
+/// calls (about 16 us a run) a run on one small file never needs.
+fn threads() -> std::num::NonZeroUsize {
+    *THREADS.get_or_init(|| std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN))
+}
+
+/// The threads hashing files at once, with --num-threads (hash_inputs sets
+/// it); 1 otherwise, so the pool has threads().
+static FILE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// The pool's threads: what the file threads leave of threads(). A file
+/// thread that hashes over the pool is one of its threads, and the pool's
+/// workers, threads() - file threads of them, serve every file thread at
+/// once, so at most threads() threads hash in all.
+fn pool_threads() -> std::num::NonZeroUsize {
+    let file_threads = FILE_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+    std::num::NonZeroUsize::new(threads().get() - file_threads + 1).expect("at most threads() file threads")
+}
+
+/// Hash `input` into `hasher`: over the pool from POOL_LEN, starting it at
+/// the first such input
+/// (`initialize_multithreaded`), so a run of small files starts no
+/// threads; on this thread below, or always with one thread.
+fn update(hasher: &mut blake3::performance::Hasher, input: &[u8]) {
+    if input.len() >= POOL_LEN && pool_threads().get() > 1 {
+        blake3::initialize_multithreaded(Some(pool_threads()));
+        hasher.update_multithreaded(input);
+    } else {
+        hasher.update(input);
+    }
+}
+
+/// The read size: each piece is hashed over the pool while the next is read.
+const PIECE: usize = 4 << 20;
+
+thread_local! {
+    /// Two pieces' buffers, kept from input to input: small files allocate nothing.
+    static BUFFERS: std::cell::RefCell<[Vec<u8>; 2]> = std::cell::RefCell::new([vec![0; PIECE], vec![0; PIECE]]);
+}
+
+/// Read from `reader` until `buffer` is full or the input ends; how much was read.
+fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+/// Hash all of `reader` (a file, or stdin) into `hasher`. Reading beats
+/// mapping a file that is not in the page cache (a read asks the storage
+/// for a whole piece; a mapping's page faults, for a few pages at a time)
+/// and comes close to it for one that is, when the reading overlaps the
+/// hashing: the first piece is read on this thread, and an input longer
+/// than a piece has the rest read on a second thread into the other
+/// buffer while this one hashes the last piece over the pool
+/// (`bench-hashes b3sum`).
+fn update_from(hasher: &mut blake3::performance::Hasher, mut reader: impl Read + Send) -> io::Result<()> {
+    BUFFERS.with_borrow_mut(|[first, second]| {
+        let mut len = fill(&mut reader, first)?;
+        // An input of one piece asks no thread count (see threads).
+        if len < PIECE {
+            update(hasher, &first[..len]);
+            return Ok(());
+        }
+        if threads().get() == 1 {
+            // Each piece read, then hashed, on this thread.
+            loop {
+                update(hasher, &first[..len]);
+                if len < PIECE {
+                    return Ok(());
+                }
+                len = fill(&mut reader, first)?;
+            }
+        }
+        std::thread::scope(|scope| {
+            let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<&mut [u8]>(1);
+            let (full_tx, full_rx) = std::sync::mpsc::sync_channel::<(&mut [u8], io::Result<usize>)>(1);
+            let reader = &mut reader;
+            scope.spawn(move || {
+                for buffer in free_rx {
+                    let read = fill(reader, buffer);
+                    // A short piece, or an error, ends the input.
+                    let last = !matches!(read, Ok(n) if n == buffer.len());
+                    if full_tx.send((buffer, read)).is_err() || last {
+                        break;
+                    }
+                }
+            });
+            free_tx.send(&mut second[..]).expect("the reader waits for a buffer");
+            let mut current: &mut [u8] = &mut first[..];
+            loop {
+                update(hasher, current);
+                let (next, read) = full_rx.recv().expect("the reader sends every piece");
+                let len = read?;
+                if len < next.len() {
+                    update(hasher, &next[..len]);
+                    return Ok(());
+                }
+                free_tx.send(current).expect("the reader waits for a buffer");
+                current = next;
+            }
+        })
+    })
 }
 
 fn write_hex_output(mut output: blake3::OutputReader, args: &Args) -> anyhow::Result<()> {
@@ -218,16 +433,9 @@ fn write_raw_output(output: blake3::OutputReader, args: &Args) -> anyhow::Result
 
 fn read_key_from_stdin() -> anyhow::Result<[u8; blake3::KEY_LEN]> {
     let mut bytes = Vec::with_capacity(blake3::KEY_LEN + 1);
-    let n = std::io::stdin()
-        .lock()
-        .take(blake3::KEY_LEN as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    let n = std::io::stdin().lock().take(blake3::KEY_LEN as u64 + 1).read_to_end(&mut bytes)?;
     if n < blake3::KEY_LEN {
-        bail!(
-            "expected {} key bytes from stdin, found {}",
-            blake3::KEY_LEN,
-            n,
-        )
+        bail!("expected {} key bytes from stdin, found {}", blake3::KEY_LEN, n,)
     } else if n > blake3::KEY_LEN {
         bail!("read more than {} key bytes from stdin", blake3::KEY_LEN)
     } else {
@@ -244,27 +452,12 @@ struct FilepathString {
 fn filepath_to_string(filepath: &Path) -> FilepathString {
     let unicode_cow = filepath.to_string_lossy();
     let mut filepath_string = unicode_cow.to_string();
-    // If we're on Windows, normalize backslashes to forward slashes. This
-    // avoids a lot of ugly escaping in the common case, and it makes
-    // checkfiles created on Windows more likely to be portable to Unix. It
-    // also allows us to set a blanket "no backslashes allowed in checkfiles on
-    // Windows" rule, rather than allowing a Unix backslash to potentially get
-    // interpreted as a directory separator on Windows.
-    if cfg!(windows) {
-        filepath_string = filepath_string.replace('\\', "/");
-    }
     let mut is_escaped = false;
     if filepath_string.contains(['\\', '\n', '\r']) {
-        filepath_string = filepath_string
-            .replace('\\', "\\\\")
-            .replace('\n', "\\n")
-            .replace('\r', "\\r");
+        filepath_string = filepath_string.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r");
         is_escaped = true;
     }
-    FilepathString {
-        filepath_string,
-        is_escaped,
-    }
+    FilepathString { filepath_string, is_escaped }
 }
 
 fn hex_half_byte(c: char) -> anyhow::Result<u8> {
@@ -295,15 +488,6 @@ fn check_for_invalid_characters(utf8_path: &str) -> anyhow::Result<()> {
     // same UTF-8 string.
     if utf8_path.contains('�') {
         bail!("Unicode replacement character in path");
-    }
-    // We normalize all Windows backslashes to forward slashes in our output,
-    // so the only natural way to get a backslash in a checkfile on Windows is
-    // to construct it on Unix and copy it over. (Or of course you could just
-    // doctor it by hand.) To avoid confusing this with a directory separator,
-    // we forbid backslashes entirely on Windows. Note that this check comes
-    // after unescaping has been done.
-    if cfg!(windows) && utf8_path.contains('\\') {
-        bail!("Backslash in path");
     }
     Ok(())
 }
@@ -394,24 +578,103 @@ fn parse_check_line(mut line: &str) -> anyhow::Result<ParsedCheckLine> {
     let expected_hash: blake3::Hash = hash_bytes.into();
 
     // Unescape and validate the filepath.
-    let file_path_string = if is_escaped {
-        unescape(file_str)?
-    } else {
-        file_str.to_string()
-    };
+    let file_path_string = if is_escaped { unescape(file_str)? } else { file_str.to_string() };
     ensure!(!file_path_string.is_empty(), "empty file path");
     check_for_invalid_characters(&file_path_string)?;
 
-    Ok(ParsedCheckLine {
-        file_string: file_str.to_string(),
-        is_escaped,
-        file_path: file_path_string.into(),
-        expected_hash,
+    Ok(ParsedCheckLine { file_string: file_str.to_string(), is_escaped, file_path: file_path_string.into(), expected_hash })
+}
+
+/// Hash every input and print each line in the inputs' order; how many
+/// failed. Errors are printed to stderr and the rest go on (`b3sum *`
+/// meets directories), and the exit status counts them. Several inputs
+/// hash on several threads at once: a tree of small files costs mostly
+/// opening and reading each, which one thread does one at a time.
+fn hash_inputs(args: &Args) -> u64 {
+    #[cfg(target_os = "linux")]
+    if readahead::applies(args) {
+        return readahead::hash_inputs(args);
+    }
+    // One file, one thread: the thread count (available_parallelism reads
+    // the process's cgroup files on Linux, eight system calls, about 16 us a
+    // run) is never needed for one (a large one asks for the pool, which
+    // asks).
+    let threads = if args.file_args.len() == 1 { 1 } else { threads().get().min(args.file_args.len()) };
+    hash_inputs_with(args, threads, hash_some, print_output)
+}
+
+/// Hash the inputs on `threads` threads, each running `work` over
+/// the inputs whose turn `next` gives it, and print each result in order
+/// with `print` as soon as those before it are printed: the files that
+/// failed.
+fn hash_inputs_with<O: Send>(
+    args: &Args,
+    threads: usize,
+    work: impl Fn(&Args, &std::sync::atomic::AtomicUsize, &mut dyn FnMut(usize, anyhow::Result<O>) -> bool) + Sync,
+    print_one: impl Fn(O, &Path, &Args) -> anyhow::Result<()>,
+) -> u64 {
+    // With --num-threads, the bound: the pool takes what the file threads
+    // leave. By default the pool keeps one thread a CPU beside the file
+    // threads, which keeps every core busy to the run's end: the bound
+    // cost the mixed tree 36% in the page cache and 16 x 64 MiB 17%, a
+    // large file late in the run, or on an E core, hashing alone (bench-
+    // hashes b3sum, i7-12700K, October 18).
+    if args.num_threads().is_some() {
+        FILE_THREADS.store(threads, std::sync::atomic::Ordering::Relaxed);
+    }
+    let paths = &args.file_args;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        for _ in 1..threads {
+            // Only while inputs remain: a thread costs 15-25 us to start,
+            // more than a small file takes, so a run of a few small files
+            // starts a few (ten 4 KiB files: 7 threads, where it started 9).
+            if next.load(std::sync::atomic::Ordering::Relaxed) >= paths.len() {
+                break;
+            }
+            let (next, done_tx, work) = (&next, done_tx.clone(), &work);
+            scope.spawn(move || work(args, next, &mut |i, output| done_tx.send((i, output)).is_ok()));
+        }
+        drop(done_tx);
+        // This thread hashes too, and prints whatever is next in order.
+        let mut failed = 0u64;
+        let mut printed = 0;
+        let mut waiting = std::collections::BTreeMap::new();
+        let mut print = |i: usize, output: anyhow::Result<O>, printed: &mut usize| {
+            if let Err(e) = output.and_then(|output| print_one(output, &paths[i], args)) {
+                failed = failed.saturating_add(1);
+                eprintln!("{}: {}: {}", NAME, paths[i].to_string_lossy(), e);
+            }
+            *printed += 1;
+        };
+        let mut take = |i: usize, output| {
+            waiting.insert(i, output);
+            while let Some(output) = waiting.remove(&printed) {
+                print(printed, output, &mut printed);
+            }
+            true
+        };
+        work(args, &next, &mut take);
+        for (i, output) in done_rx {
+            take(i, output);
+        }
+        failed
     })
 }
 
-fn hash_one_input(path: &Path, args: &Args) -> anyhow::Result<()> {
-    let output = hash_path(args, path)?;
+/// Hash the inputs whose turn `next` gives, one after another, giving each
+/// result to `done` (which returns false once nobody listens).
+fn hash_some(args: &Args, next: &std::sync::atomic::AtomicUsize, done: &mut dyn FnMut(usize, anyhow::Result<blake3::OutputReader>) -> bool) {
+    loop {
+        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if i >= args.file_args.len() || !done(i, hash_path(args, &args.file_args[i])) {
+            return;
+        }
+    }
+}
+
+fn print_output(output: blake3::OutputReader, path: &Path, args: &Args) -> anyhow::Result<()> {
     if args.raw() {
         write_raw_output(output, args)?;
         return Ok(());
@@ -421,10 +684,7 @@ fn hash_one_input(path: &Path, args: &Args) -> anyhow::Result<()> {
         println!();
         return Ok(());
     }
-    let FilepathString {
-        filepath_string,
-        is_escaped,
-    } = filepath_to_string(path);
+    let FilepathString { filepath_string, is_escaped } = filepath_to_string(path);
     if is_escaped {
         print!("\\");
     }
@@ -444,23 +704,14 @@ fn hash_one_input(path: &Path, args: &Args) -> anyhow::Result<()> {
 // forget to set it in some error condition.
 fn check_one_line(line: &str, args: &Args) -> bool {
     let parse_result = parse_check_line(&line);
-    let ParsedCheckLine {
-        file_string,
-        is_escaped,
-        file_path,
-        expected_hash,
-    } = match parse_result {
+    let ParsedCheckLine { file_string, is_escaped, file_path, expected_hash } = match parse_result {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("{}: {}", NAME, e);
             return false;
         }
     };
-    let file_string = if is_escaped {
-        "\\".to_string() + &file_string
-    } else {
-        file_string
-    };
+    let file_string = if is_escaped { "\\".to_string() + &file_string } else { file_string };
     let found_hash: blake3::Hash;
     match hash_path(args, &file_path) {
         Ok(mut output) => {
@@ -516,49 +767,84 @@ fn check_one_checkfile(path: &Path, args: &Args, files_failed: &mut u64) -> anyh
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse()?;
-    let mut thread_pool_builder = rayon_core::ThreadPoolBuilder::new();
-    if let Some(num_threads) = args.num_threads() {
-        thread_pool_builder = thread_pool_builder.num_threads(num_threads);
-    }
-    let thread_pool = thread_pool_builder.build()?;
-    thread_pool.install(|| {
-        let mut files_failed = 0u64;
-        // Note that file_args automatically includes `-` if nothing is given.
-        for path in &args.file_args {
-            if args.check() {
-                check_one_checkfile(path, &args, &mut files_failed)?;
-            } else {
-                // Errors encountered in hashing are tolerated and printed to
-                // stderr. This allows e.g. `b3sum *` to print errors for
-                // non-files and keep going. However, if we encounter any
-                // errors we'll still return non-zero at the end.
-                let result = hash_one_input(path, &args);
-                if let Err(e) = result {
-                    files_failed = files_failed.saturating_add(1);
-                    eprintln!("{}: {}: {}", NAME, path.to_string_lossy(), e);
-                }
+/// A mapped file that another program truncates while b3sum reads it
+/// raises SIGBUS at the first page past its new end, and that is by far
+/// the likeliest SIGBUS here; but a hardware memory error raises it too,
+/// so the message says what b3sum knows, then stops, rather than die
+/// unexplained. (Only write and _exit here: a signal handler may call
+/// nothing else.)
+#[cfg(unix)]
+fn explain_sigbus() {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    extern "C" fn on_sigbus(_: libc::c_int) {
+        // Once, whichever threads fault (an atomic swap is signal-safe).
+        if SAID.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            loop {
+                // Sound: pause is async-signal-safe; the first thread exits.
+                unsafe { libc::pause() };
             }
         }
-        if args.check() && files_failed > 0 {
-            eprintln!(
-                "{}: WARNING: {} computed checksum{} did NOT match",
-                NAME,
-                files_failed,
-                if files_failed == 1 { "" } else { "s" },
-            );
+        const MESSAGE: &[u8] = b"b3sum: a bus error while reading a mapped file; most likely another program truncated it, so no digest of it would be right. Hash the files again once nothing writes to them.\n";
+        // Sound: write and _exit are async-signal-safe.
+        unsafe {
+            libc::write(2, MESSAGE.as_ptr().cast(), MESSAGE.len());
+            libc::_exit(1);
         }
-        std::process::exit(if files_failed > 0 { 1 } else { 0 });
-    })
+    }
+    // Sound: a handler that calls only async-signal-safe functions.
+    let handler: extern "C" fn(libc::c_int) = on_sigbus;
+    unsafe { libc::signal(libc::SIGBUS, handler as libc::sighandler_t) };
+}
+
+fn main() -> anyhow::Result<()> {
+    // A reader that goes away (`b3sum * | head`) ends b3sum at once and
+    // quietly, as it ends GNU's tools: Rust ignores SIGPIPE, so b3sum's next
+    // write failed and panicked ("failed printing to stdout", status 101).
+    #[cfg(unix)]
+    // Sound: restoring a signal's default action.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL)
+    };
+    #[cfg(unix)]
+    explain_sigbus();
+    blake3::initialize();
+    let args = Args::parse()?;
+    if let Some(threads) = args.num_threads() {
+        THREADS.set(threads).expect("main sets the threads first");
+    }
+    let mut files_failed = 0u64;
+    // Note that file_args automatically includes `-` if nothing is given.
+    if args.check() {
+        for path in &args.file_args {
+            check_one_checkfile(path, &args, &mut files_failed)?;
+        }
+    } else {
+        files_failed = hash_inputs(&args);
+    }
+    if args.check() && files_failed > 0 {
+        eprintln!("{}: WARNING: {} computed checksum{} did NOT match", NAME, files_failed, if files_failed == 1 { "" } else { "s" },);
+    }
+    let status = if files_failed > 0 { 1 } else { 0 };
+    // Crash-only: the output flushed, then the process ended at once, with
+    // no exit-time teardown. b3sum registers no exit handlers and writes
+    // nothing but stdout and stderr, so the teardown has nothing to do, and
+    // the process's exit reclaims everything (6 us a 64-byte file,
+    // i7-12700K).
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // Sound: _exit takes any status and does not return.
+    unsafe { libc::_exit(status) }
 }
 
 #[cfg(test)]
 mod test {
+    include!("../../tools/require_nextest.rs");
     use clap::CommandFactory;
 
     #[test]
     fn test_args() {
+        blake3::initialize();
         crate::Inner::command().debug_assert();
     }
 }

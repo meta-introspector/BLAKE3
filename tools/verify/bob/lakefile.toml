@@ -1,0 +1,17 @@
+name = "bob"
+defaultTargets = ["Bob"]
+
+[[lean_lib]]
+name = "Bob"
+
+[[lean_lib]]
+name = "Dev"
+globs = ["Dev.Serialize", "Dev.Certificate"]
+
+[[lean_exe]]
+name = "bob-parse-all"
+root = "Dev.ParseAll"
+
+[[lean_exe]]
+name = "bob-parse-certificate"
+root = "Dev.Certificate"

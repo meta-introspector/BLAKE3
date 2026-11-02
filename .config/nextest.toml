@@ -1,0 +1,39 @@
+# cargo-nextest's profiles for this repository (tools/mutants/check.py).
+#
+# One clock a run, and only here: each profile's slow-timeout is the one
+# limit on a test's time in that run. Tests hold no watchdogs of their own,
+# and check.py's cargo-mutants limit is a backstop whose firing is an error,
+# not a verdict (two clocks over one test made its outcome depend on which
+# ran out first, and on the machine's load: an EPYC 9255, October 22).
+
+[profile.default]
+# A test still running at 60 s hangs: killed and named. It replaces the
+# integration tests' own watchdogs (20 s and 60 s) and the idle-park test's
+# 10 s wait. It is new to the tests without a watchdog, so measure the
+# slowest test of CI's debug and QEMU jobs before landing: the clock must
+# sit well above every test there.
+slow-timeout = { period = "60s", terminate-after = 1 }
+
+[profile.mutants]
+# A mutant's tests stop at the first that fails: a caught mutant costs the
+# tests up to its first catcher. Each test in its own process.
+fail-fast = true
+# A test still running at 30 s hangs: killed and named. The run's one
+# clock: check.py reports a mutant that only this clock stopped as CLOCK
+# ONLY, not as caught by a test. The slowest test takes under 1 s alone,
+# but at 5 s this clock stopped an unmutated stream test (5,055 ms, a
+# compiled-out mutant, six shards on 48 threads: an EPYC 9255, October
+# 22), so it sits far above any test's time under a run's load; a hang
+# costs 25 s more than it did.
+slow-timeout = { period = "30s", terminate-after = 1 }
+# Each test's line once, as it ends, with its outcome and time.
+status-level = "all"
+final-status-level = "none"
+
+[profile.mutants-map]
+# As `mutants`, but every test runs on every mutant: the record names every
+# test that catches each one, with its time (check.py --map).
+fail-fast = false
+slow-timeout = { period = "30s", terminate-after = 1 }
+status-level = "all"
+final-status-level = "none"

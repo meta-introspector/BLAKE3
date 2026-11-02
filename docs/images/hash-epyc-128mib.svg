@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="288" viewBox="0 0 720 288" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect width="720" height="288" fill="#ffffff"/>
+<text x="170" y="28" font-size="17" font-weight="600" fill="#111827">Hashing one 128 MiB message</text>
+<text x="170" y="50" font-size="13" fill="#4b5563">faster →</text>
+<text x="160" y="95.7" font-size="13" fill="#111827" text-anchor="end" font-weight="600">BLAKE3, multi-core</text>
+<rect x="170" y="78" width="450.0" height="26" rx="3" fill="#7c3aed"/>
+<text x="626.0" y="95.7" font-size="13" fill="#111827" font-weight="600">30 GB/s</text>
+<text x="160" y="131.7" font-size="13" fill="#111827" text-anchor="end" font-weight="600">BLAKE3, one core</text>
+<rect x="170" y="114" width="129.9" height="26" rx="3" fill="#7c3aed"/>
+<text x="305.9" y="131.7" font-size="13" fill="#111827" font-weight="600">8.53 GB/s</text>
+<text x="160" y="167.7" font-size="13" fill="#111827" text-anchor="end">SHA-256</text>
+<rect x="170" y="150" width="30.6" height="26" rx="3" fill="#c2410c"/>
+<text x="206.6" y="167.7" font-size="13" fill="#111827">2.01 GB/s</text>
+<text x="160" y="203.7" font-size="13" fill="#111827" text-anchor="end">SHA-1</text>
+<rect x="170" y="186" width="9.9" height="26" rx="3" fill="#8a7a1e"/>
+<text x="185.9" y="203.7" font-size="13" fill="#111827">0.65 GB/s</text>
+<text x="160" y="239.7" font-size="13" fill="#111827" text-anchor="end">SHA3-256</text>
+<rect x="170" y="222" width="8.4" height="26" rx="3" fill="#db2777"/>
+<text x="184.4" y="239.7" font-size="13" fill="#111827">0.55 GB/s</text>
+<text x="170" y="276.0" font-size="11" fill="#9a9a9a">AMD EPYC 9255 24-Core Processor, 48 CPUs · bench-hashes 0.18.1 on 2026-10-27</text>
+</svg>

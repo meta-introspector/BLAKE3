@@ -13,14 +13,14 @@
 #endif
 
 .intel_syntax noprefix
-.global _blake3_hash_many_avx512
-.global blake3_hash_many_avx512
-.global blake3_compress_in_place_avx512
-.global _blake3_compress_in_place_avx512
-.global blake3_compress_xof_avx512
-.global _blake3_compress_xof_avx512
-.global blake3_xof_many_avx512
-.global _blake3_xof_many_avx512
+.global _blake3_servil_hash_many_avx512
+.global blake3_servil_hash_many_avx512
+.global blake3_servil_compress_in_place_avx512
+.global _blake3_servil_compress_in_place_avx512
+.global blake3_servil_compress_xof_avx512
+.global _blake3_servil_compress_xof_avx512
+.global blake3_servil_xof_many_avx512
+.global _blake3_servil_xof_many_avx512
 
 #ifdef __APPLE__
 .text
@@ -28,8 +28,8 @@
 .section .text
 #endif
 .p2align  6
-_blake3_hash_many_avx512:
-blake3_hash_many_avx512:
+_blake3_servil_hash_many_avx512:
+blake3_servil_hash_many_avx512:
         _CET_ENDBR
         push    r15
         push    r14
@@ -2082,21 +2082,21 @@ blake3_hash_many_avx512:
         vmovdqa32 zmm2, zmm15
         vpbroadcastd zmm8, dword ptr [rsp+0x22*0x4]
         vpblendmd zmm3 {k4}, zmm13, zmm8
-        vmovups zmm8, zmmword ptr [r8+rdx-0x1*0x40]
+        vmovups xmm8, xmmword ptr [r8+rdx-0x1*0x40]
         vinserti32x4 zmm8, zmm8, xmmword ptr [r9+rdx-0x4*0x10], 0x01
         vinserti32x4 zmm8, zmm8, xmmword ptr [r10+rdx-0x4*0x10], 0x02
         vinserti32x4 zmm8, zmm8, xmmword ptr [r11+rdx-0x4*0x10], 0x03
-        vmovups zmm9, zmmword ptr [r8+rdx-0x30]
+        vmovups xmm9, xmmword ptr [r8+rdx-0x30]
         vinserti32x4 zmm9, zmm9, xmmword ptr [r9+rdx-0x3*0x10], 0x01
         vinserti32x4 zmm9, zmm9, xmmword ptr [r10+rdx-0x3*0x10], 0x02
         vinserti32x4 zmm9, zmm9, xmmword ptr [r11+rdx-0x3*0x10], 0x03
         vshufps zmm4, zmm8, zmm9, 136
         vshufps zmm5, zmm8, zmm9, 221
-        vmovups zmm8, zmmword ptr [r8+rdx-0x20]
+        vmovups xmm8, xmmword ptr [r8+rdx-0x20]
         vinserti32x4 zmm8, zmm8, xmmword ptr [r9+rdx-0x2*0x10], 0x01
         vinserti32x4 zmm8, zmm8, xmmword ptr [r10+rdx-0x2*0x10], 0x02
         vinserti32x4 zmm8, zmm8, xmmword ptr [r11+rdx-0x2*0x10], 0x03
-        vmovups zmm9, zmmword ptr [r8+rdx-0x10]
+        vmovups xmm9, xmmword ptr [r8+rdx-0x10]
         vinserti32x4 zmm9, zmm9, xmmword ptr [r9+rdx-0x1*0x10], 0x01
         vinserti32x4 zmm9, zmm9, xmmword ptr [r10+rdx-0x1*0x10], 0x02
         vinserti32x4 zmm9, zmm9, xmmword ptr [r11+rdx-0x1*0x10], 0x03
@@ -2207,15 +2207,15 @@ blake3_hash_many_avx512:
         vbroadcasti128 ymm2, xmmword ptr [BLAKE3_IV+rip]
         vpbroadcastd ymm8, dword ptr [rsp+0x88]
         vpblendd ymm3, ymm13, ymm8, 0x88
-        vmovups ymm8, ymmword ptr [r8+rdx-0x40]
+        vmovups xmm8, xmmword ptr [r8+rdx-0x40]
         vinsertf128 ymm8, ymm8, xmmword ptr [r9+rdx-0x40], 0x01
-        vmovups ymm9, ymmword ptr [r8+rdx-0x30]
+        vmovups xmm9, xmmword ptr [r8+rdx-0x30]
         vinsertf128 ymm9, ymm9, xmmword ptr [r9+rdx-0x30], 0x01
         vshufps ymm4, ymm8, ymm9, 136
         vshufps ymm5, ymm8, ymm9, 221
-        vmovups ymm8, ymmword ptr [r8+rdx-0x20]
+        vmovups xmm8, xmmword ptr [r8+rdx-0x20]
         vinsertf128 ymm8, ymm8, xmmword ptr [r9+rdx-0x20], 0x01
-        vmovups ymm9, ymmword ptr [r8+rdx-0x10]
+        vmovups xmm9, xmmword ptr [r8+rdx-0x10]
         vinsertf128 ymm9, ymm9, xmmword ptr [r9+rdx-0x10], 0x01
         vshufps ymm6, ymm8, ymm9, 136
         vshufps ymm7, ymm8, ymm9, 221
@@ -2386,8 +2386,8 @@ blake3_hash_many_avx512:
         vmovdqu xmmword ptr [rbx+0x10], xmm1
         jmp     4b
 .p2align 6
-_blake3_compress_in_place_avx512:
-blake3_compress_in_place_avx512:
+_blake3_servil_compress_in_place_avx512:
+blake3_servil_compress_in_place_avx512:
         _CET_ENDBR
         vmovdqu xmm0, xmmword ptr [rdi]
         vmovdqu xmm1, xmmword ptr [rdi+0x10]
@@ -2469,8 +2469,8 @@ blake3_compress_in_place_avx512:
         ret
 
 .p2align 6
-_blake3_compress_xof_avx512:
-blake3_compress_xof_avx512:
+_blake3_servil_compress_xof_avx512:
+blake3_servil_compress_xof_avx512:
         _CET_ENDBR
         vmovdqu xmm0, xmmword ptr [rdi]
         vmovdqu xmm1, xmmword ptr [rdi+0x10]
@@ -2556,8 +2556,8 @@ blake3_compress_xof_avx512:
         ret
 
 .p2align 6
-blake3_xof_many_avx512:
-_blake3_xof_many_avx512:
+blake3_servil_xof_many_avx512:
+_blake3_servil_xof_many_avx512:
         _CET_ENDBR
         mov    r10,QWORD PTR [rsp+0x8]
         cmp    r10,0x1
