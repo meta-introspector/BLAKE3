@@ -28,7 +28,7 @@ Use one clear mechanism wherever it serves. When approaches perform similarly, c
 
 ## Communication
 
-- Phrase positively or neutrally; avoid negations and "not this, but that" contrasts.
+- Phrase positively or neutrally, each statement standing on its own. A rule names the habit to keep: a reader steers toward whatever holds their attention, as a rider steers toward what they look at (target fixation; Zooko, November 2, 2026).
 - Frame positively: show the promising, successful aspects of the recommended path. Mention an alternative only when its trade-offs deserve our attention.
 - The reader has limited working memory and limited ability to search back through recent text. Include only what the current focus needs.
 
