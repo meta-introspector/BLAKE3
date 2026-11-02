@@ -8,10 +8,13 @@ too long or too chained to hold in mind.
     python3 tools/claudish.py FILE...     # Markdown whole; other files' comment lines
     python3 tools/claudish.py - < draft   # a commit message or comment, before it goes
 
-Each warning names a line, a rule and the words. A warning is a reason to
-reread the sentence, and judgment decides what changes: often nothing,
-sometimes a rewrite of the paragraph around it. The script always exits 0.
+Each warning names a line, a rule and the words, and the output ends with
+the passage of AGENTS.md (the one beside this script) behind each rule
+that fired. A warning is a reason to reread the sentence, and judgment
+decides what changes: often nothing, sometimes a rewrite of the
+paragraph around it. The script always exits 0.
 """
+import os
 import re
 import sys
 
@@ -24,6 +27,31 @@ RULES = [
     ("dash", r"\w\s?—\s?\w"),
 ]
 LONG_WORDS, CHAIN_MARKS = 50, 4
+
+# Each rule's passage in AGENTS.md's "Communication", found by a phrase of it.
+WHY = {
+    "contrast": "Phrase positively or neutrally",
+    "prohibition": "A rule names the habit to keep",
+    "vocabulary": "warns on a few patterns that sound like a language model",
+    "filler": "Sand off filler words",
+    "metadiscourse": "Trim metadiscourse",
+    "dash": "warns on a few patterns that sound like a language model",
+    "long": "The reader has limited working memory",
+    "chained": "The reader has limited working memory",
+}
+AGENTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "AGENTS.md")
+
+
+def passages():
+    """Each rule's passage: (AGENTS.md's line number, its text). Stops when
+    a phrase is gone from AGENTS.md: the two change together."""
+    lines = open(AGENTS).read().split("\n")
+    found = {}
+    for rule, phrase in WHY.items():
+        at = [n for n, line in enumerate(lines, 1) if phrase in line]
+        assert at, f"claudish: AGENTS.md no longer says {phrase!r}: change WHY with it"
+        found[rule] = (at[0], lines[at[0] - 1].strip().lstrip("-0123456789. "))
+    return found
 
 
 def prose(path, text):
@@ -60,7 +88,7 @@ def sentences(lines):
         words.append(s)
 
 
-def lint(path, text):
+def lint(path, text, fired):
     count = 0
     for line, s in sentences(prose(path, text)):
         found = [(name, m.group(0)) for name, rule in RULES for m in re.finditer(rule, s, re.I)]
@@ -70,10 +98,18 @@ def lint(path, text):
         if marks >= CHAIN_MARKS:
             found.append(("chained", f"{marks} colons and semicolons"))
         for name, words in found:
+            fired.add(name)
             print(f"{path}:{line}: {name}: {words!r} in: {s[:100]}{'...' if len(s) > 100 else ''}")
         count += len(found)
     return count
 
 
-total = sum(lint(p, sys.stdin.read() if p == "-" else open(p).read()) for p in sys.argv[1:])
+why = passages()
+fired = set()
+total = sum(lint(p, sys.stdin.read() if p == "-" else open(p).read(), fired) for p in sys.argv[1:])
+if fired:
+    print("Why, in AGENTS.md's \"Communication\":")
+    for line, text in sorted({why[name] for name in fired}):
+        rules = ", ".join(n for n in WHY if n in fired and why[n] == (line, text))
+        print(f"  {rules}: AGENTS.md:{line}: {text[:140]}{'...' if len(text) > 140 else ''}")
 print(f"{total} warnings: each a reason to reread, none an error", file=sys.stderr)
