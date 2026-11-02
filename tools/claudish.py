@@ -1,7 +1,9 @@
 """Warns on a few patterns of prose that sound like a language model
 (Claudish) or that work against AGENTS.md's "Communication": contrasts
-built on a negation, stock vocabulary, filler and metadiscourse, mid-
-sentence dashes, and sentences too long or too chained to hold in mind.
+built on a negation, prohibitions (a rule that names a habit to drop,
+where naming the habit to keep steers the reader better), stock
+vocabulary, filler and metadiscourse, mid-sentence dashes, and sentences
+too long or too chained to hold in mind.
 
     python3 tools/claudish.py FILE...     # Markdown whole; other files' comment lines
     python3 tools/claudish.py - < draft   # a commit message or comment, before it goes
@@ -15,6 +17,7 @@ import sys
 
 RULES = [
     ("contrast", r"\bnot\b[^.;:]{1,60}?,\s*but\b|,\s+not\s+(?:a |an |the )?[\w-]+[,.;]|\brather than\b|\binstead of\b|\bnot (?:only|just|merely)\b"),
+    ("prohibition", r"\b(?:never|don't|do not|avoid(?:s|ed|ing)?|refrain\w*)\b"),
     ("vocabulary", r"\bload-bearing\b|\bspine\b|\bseams?\b|\bcrisp\w*|\bgenuine(?:ly)?\b|\bhonest\b|\bthe shape of\b|\bdelve\w*|\bthe real (?:question|issue|work|cost|win)\b|\btapestry\b|\bnuanced?\b|\brobust(?:ly)?\b|\bseamless(?:ly)?\b"),
     ("filler", r"\b(?:simply|just|really|actually|quite|very|basically|essentially|truly)\b"),
     ("metadiscourse", r"\b(?:note that|it is worth|it's worth|worth noting|in other words|to be clear|importantly|here's the thing|that said)\b"),
